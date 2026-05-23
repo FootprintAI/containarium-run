@@ -1,0 +1,248 @@
+# GitHub Action: containarium-run
+#
+# Spins up a Containarium box per CI job, runs the project's
+# .github/containarium.yml `setup:` + `test:` commands inside it, and
+# tears it down. On failure, can keep the box alive for an hour and
+# post a comment with SSH + agent-box MCP URLs so a human or an
+# agent can debug the broken state in place.
+#
+# Status: v0 SCAFFOLD. The action surface (inputs/outputs/composition)
+# is the contract we intend to ship. Several steps have `# TODO:`
+# markers where the underlying containarium CLI or Cloud API surface
+# still needs work — see STATUS.md.
+
+name: 'Containarium Run'
+description: 'Run CI in a Containarium box you can SSH into when it fails. Bring your own agent for debug-on-failure.'
+author: 'FootprintAI'
+
+branding:
+  icon: 'box'
+  color: 'blue'
+
+inputs:
+  server:
+    description: 'Containarium server address (matches the CLI''s --server flag and CONTAINARIUM_SERVER env var). Defaults to Containarium Cloud; point at https://your-host:8080 for self-hosted.'
+    required: false
+    default: 'https://api.containarium.dev'
+  token:
+    description: 'API token (use a GitHub secret).'
+    required: true
+  config:
+    description: 'Path to containarium.yml in your repo.'
+    required: false
+    default: '.github/containarium.yml'
+  cache-key:
+    description: 'Optional cache key to reuse a warm box volume across runs (e.g. ${{ hashFiles(''go.sum'') }}). v0: not yet implemented — set but ignored.'
+    required: false
+    default: ''
+  keep-on-failure:
+    description: 'On failure, keep the box alive for 1h and post a PR comment with SSH + MCP debug URLs.'
+    required: false
+    default: 'true'
+
+outputs:
+  box-id:
+    description: 'The Containarium box ID created for this run.'
+    value: ${{ steps.create.outputs.box-id }}
+  preview-url:
+    description: 'Public URL if containarium.yml defines a serve: block.'
+    value: ${{ steps.expose.outputs.url }}
+  debug-url:
+    description: 'Agent-box MCP URL (only set on failure when keep-on-failure=true).'
+    value: ${{ steps.debug.outputs.url }}
+
+runs:
+  using: 'composite'
+  steps:
+    # ------------------------------------------------------------------
+    # 1. Install the containarium CLI on the GHA runner.
+    # ------------------------------------------------------------------
+    - name: Install containarium CLI
+      shell: bash
+      env:
+        CONTAINARIUM_VERSION: ${{ env.CONTAINARIUM_CLI_VERSION || 'latest' }}
+      run: |
+        set -euo pipefail
+        # install-cli.sh pulls just the CLI binary (no daemon, no Incus).
+        # Requires hacks/install-cli.sh on the FootprintAI/containarium
+        # main branch — see https://github.com/FootprintAI/Containarium/pull/295.
+        curl -fsSL \
+          https://raw.githubusercontent.com/footprintai/containarium/main/hacks/install-cli.sh \
+          | sudo bash
+        containarium --version
+
+    # ------------------------------------------------------------------
+    # 2. Parse the user's containarium.yml.
+    # ------------------------------------------------------------------
+    - name: Parse containarium.yml
+      shell: bash
+      id: config
+      run: |
+        set -euo pipefail
+        CFG="${{ inputs.config }}"
+        if [ ! -f "$CFG" ]; then
+          echo "::error::config file not found: $CFG"
+          exit 1
+        fi
+        # yq is preinstalled on ubuntu-latest runners.
+        IMAGE=$(yq -r '.image // "ubuntu-24.04"' "$CFG")
+        SETUP=$(yq -r '.setup // [] | join(" && ")' "$CFG")
+        TEST=$(yq -r '.test  // [] | join(" && ")' "$CFG")
+        SERVE_CMD=$(yq -r '.serve.command // ""' "$CFG")
+        SERVE_PORT=$(yq -r '.serve.port // ""' "$CFG")
+        {
+          echo "image=$IMAGE"
+          echo "setup<<EOF"; echo "$SETUP"; echo "EOF"
+          echo "test<<EOF";  echo "$TEST";  echo "EOF"
+          echo "serve-cmd=$SERVE_CMD"
+          echo "serve-port=$SERVE_PORT"
+        } >> "$GITHUB_OUTPUT"
+
+    # ------------------------------------------------------------------
+    # 3. Create the box.
+    # ------------------------------------------------------------------
+    - name: Create Containarium box
+      shell: bash
+      id: create
+      env:
+        CONTAINARIUM_HTTP:   'true'
+        CONTAINARIUM_SERVER: ${{ inputs.server }}
+        CONTAINARIUM_TOKEN:  ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+        BOX_NAME="ci-${GITHUB_REPOSITORY##*/}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        # TODO: containarium create currently targets the local daemon.
+        # The CLI needs `--api-url` + `--token` flags (or env-var honoring)
+        # to talk to remote Cloud / self-hosted endpoints. Track at
+        # FootprintAI/containarium#TODO.
+        containarium create "$BOX_NAME" --image "${{ steps.config.outputs.image }}"
+        echo "box-id=$BOX_NAME" >> "$GITHUB_OUTPUT"
+
+    # ------------------------------------------------------------------
+    # 4. Push source code into the box.
+    # ------------------------------------------------------------------
+    - name: Push source to box
+      shell: bash
+      env:
+        CONTAINARIUM_HTTP:   'true'
+        CONTAINARIUM_SERVER: ${{ inputs.server }}
+        CONTAINARIUM_TOKEN:  ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+        BOX="${{ steps.create.outputs.box-id }}"
+        # ssh-config sync writes ~/.containarium/ssh_config; we point ssh/rsync
+        # at it directly without touching ~/.ssh/config.
+        containarium ssh-config sync
+        SSH_CFG="$HOME/.containarium/ssh_config"
+        # TODO: pick a stable workdir convention for CI runs (e.g. /workspace).
+        # Confirm the box's default user has write access there, or chown on
+        # first push.
+        rsync -az --delete \
+          -e "ssh -F $SSH_CFG -o StrictHostKeyChecking=accept-new -o BatchMode=yes" \
+          ./ "$BOX:/workspace/"
+
+    # ------------------------------------------------------------------
+    # 5. Run setup commands inside the box (the "warm cache" half).
+    # ------------------------------------------------------------------
+    - name: Run setup
+      shell: bash
+      if: steps.config.outputs.setup != ''
+      run: |
+        set -euo pipefail
+        BOX="${{ steps.create.outputs.box-id }}"
+        SSH_CFG="$HOME/.containarium/ssh_config"
+        ssh -F "$SSH_CFG" -o BatchMode=yes "$BOX" -- \
+          "cd /workspace && ${{ steps.config.outputs.setup }}"
+
+    # ------------------------------------------------------------------
+    # 6. Run the actual tests.
+    # ------------------------------------------------------------------
+    - name: Run test
+      shell: bash
+      id: test
+      run: |
+        set -euo pipefail
+        BOX="${{ steps.create.outputs.box-id }}"
+        SSH_CFG="$HOME/.containarium/ssh_config"
+        ssh -F "$SSH_CFG" -o BatchMode=yes "$BOX" -- \
+          "cd /workspace && ${{ steps.config.outputs.test }}"
+
+    # ------------------------------------------------------------------
+    # 7. If containarium.yml had a `serve:` block, expose it.
+    #    (Used for PR-preview environments — irrelevant for plain CI.)
+    # ------------------------------------------------------------------
+    - name: Expose port (if serve: defined)
+      shell: bash
+      id: expose
+      if: steps.config.outputs.serve-port != ''
+      env:
+        CONTAINARIUM_HTTP:   'true'
+        CONTAINARIUM_SERVER: ${{ inputs.server }}
+        CONTAINARIUM_TOKEN:  ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+        BOX="${{ steps.create.outputs.box-id }}"
+        SSH_CFG="$HOME/.containarium/ssh_config"
+        # Start the serve command in the background inside the box.
+        ssh -F "$SSH_CFG" -o BatchMode=yes "$BOX" -- \
+          "cd /workspace && nohup ${{ steps.config.outputs.serve-cmd }} >/tmp/serve.log 2>&1 &"
+        # Expose the port — the CLI prints the public URL on success.
+        URL=$(containarium expose-port "$BOX" --port "${{ steps.config.outputs.serve-port }}" --output url)
+        echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+    # ------------------------------------------------------------------
+    # 8. SUCCESS PATH — tear down the box.
+    # ------------------------------------------------------------------
+    - name: Tear down box (success)
+      shell: bash
+      if: success()
+      env:
+        CONTAINARIUM_HTTP:   'true'
+        CONTAINARIUM_SERVER: ${{ inputs.server }}
+        CONTAINARIUM_TOKEN:  ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+        containarium delete "${{ steps.create.outputs.box-id }}" --yes
+
+    # ------------------------------------------------------------------
+    # 9. FAILURE PATH — keep box alive, post debug PR comment.
+    # ------------------------------------------------------------------
+    - name: Keep box alive + post debug comment on failure
+      shell: bash
+      id: debug
+      if: failure() && inputs.keep-on-failure == 'true' && github.event_name == 'pull_request'
+      env:
+        GH_TOKEN: ${{ github.token }}
+        CONTAINARIUM_HTTP:   'true'
+        CONTAINARIUM_SERVER: ${{ inputs.server }}
+        CONTAINARIUM_TOKEN:  ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+        BOX="${{ steps.create.outputs.box-id }}"
+        # TODO: schedule auto-delete in 1h. Either via `containarium ttl set`
+        # (new CLI verb needed) or via the Cloud API. Without this the box
+        # leaks until manually deleted.
+        # TODO: extract host suffix from --api-url instead of hardcoding the
+        # cloud domain.
+        SSH_CMD="ssh -p 2222 debug@${BOX}.boxes.containarium.dev"
+        MCP_URL="ssh user@${BOX}.containarium.dev agent-box"
+        echo "url=$MCP_URL" >> "$GITHUB_OUTPUT"
+        # TODO: sticky-comment behavior — find existing containarium-bot
+        # comment on this PR and edit it instead of posting a new one.
+        gh pr comment "${{ github.event.pull_request.number }}" --body "$(cat <<EOF
+        ### ❌ CI failed — box kept alive for debugging
+
+        **Debug this box live** (expires in 60 minutes)
+
+        \`\`\`bash
+        # SSH in
+        ${SSH_CMD}
+
+        # Or hand it to your agent (Claude Code, Cursor, ...)
+        # The box's agent-box MCP server is reachable over SSH-stdio:
+        ${MCP_URL}
+        \`\`\`
+
+        Posted by [containarium-run](https://github.com/FootprintAI/containarium-run) · commit \`${GITHUB_SHA:0:7}\`
+        EOF
+        )"
