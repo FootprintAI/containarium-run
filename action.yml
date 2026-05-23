@@ -142,7 +142,81 @@ runs:
           ./ "$BOX:/workspace/"
 
     # ------------------------------------------------------------------
-    # 5. Run setup commands inside the box (the "warm cache" half).
+    # 5. Write CI context file into the box.
+    #
+    # Drops /workspace/.containarium/ci-context.json so the agent-box
+    # MCP server can expose it as a resource. Without this, an agent
+    # connecting to a failing box has zero context and wastes its first
+    # turn asking "what am I looking at?" — see the companion change to
+    # agent-box that surfaces this file as an MCP resource.
+    #
+    # On the create-time write we know everything except failing_test /
+    # failure_log_tail; those fields are appended/overwritten by the
+    # failure-handling step below if the test step fails.
+    # ------------------------------------------------------------------
+    - name: Write CI context to box
+      shell: bash
+      run: |
+        set -euo pipefail
+        BOX="${{ steps.create.outputs.box-id }}"
+        SSH_CFG="$HOME/.containarium/ssh_config"
+
+        # Pull PR-specific fields out of the event payload when this is a
+        # pull_request event; on push events they stay null and jq omits
+        # them via the `// empty` fallbacks below.
+        PR_NUMBER=""
+        PR_URL=""
+        PR_TITLE=""
+        BRANCH=""
+        if [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ] && [ -f "${GITHUB_EVENT_PATH:-}" ]; then
+          PR_NUMBER=$(jq -r '.pull_request.number // empty' "$GITHUB_EVENT_PATH")
+          PR_URL=$(jq -r '.pull_request.html_url // empty' "$GITHUB_EVENT_PATH")
+          PR_TITLE=$(jq -r '.pull_request.title // empty' "$GITHUB_EVENT_PATH")
+          BRANCH=$(jq -r '.pull_request.head.ref // empty' "$GITHUB_EVENT_PATH")
+        else
+          # push event: branch comes from GITHUB_REF_NAME, PR fields stay empty.
+          BRANCH="${GITHUB_REF_NAME:-}"
+        fi
+
+        RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+        # Build JSON with jq so user-controlled values (PR title, branch
+        # name, actor) can never break out of string context. Numeric
+        # fields use --argjson with a `// null` fallback for the push-event
+        # case where pr_number is empty.
+        jq -n \
+          --arg   repo         "$GITHUB_REPOSITORY" \
+          --arg   pr_url       "$PR_URL" \
+          --arg   pr_title     "$PR_TITLE" \
+          --arg   commit_sha   "$GITHUB_SHA" \
+          --arg   branch       "$BRANCH" \
+          --arg   actor        "$GITHUB_ACTOR" \
+          --arg   run_id       "$GITHUB_RUN_ID" \
+          --arg   run_url      "$RUN_URL" \
+          --argjson pr_number  "${PR_NUMBER:-null}" \
+          --argjson run_attempt "${GITHUB_RUN_ATTEMPT:-1}" \
+          '{
+            schema_version: "1.0",
+            platform: "github",
+            repo: $repo,
+            pr_number: $pr_number,
+            pr_url: (if $pr_url == "" then null else $pr_url end),
+            pr_title: (if $pr_title == "" then null else $pr_title end),
+            commit_sha: $commit_sha,
+            branch: (if $branch == "" then null else $branch end),
+            actor: $actor,
+            run_id: $run_id,
+            run_url: $run_url,
+            run_attempt: $run_attempt,
+            workspace_path: "/workspace"
+          }' \
+          > /tmp/ci-context.json
+
+        ssh -F "$SSH_CFG" -o BatchMode=yes "$BOX" -- "mkdir -p /workspace/.containarium"
+        scp -F "$SSH_CFG" /tmp/ci-context.json "$BOX:/workspace/.containarium/ci-context.json"
+
+    # ------------------------------------------------------------------
+    # 6. Run setup commands inside the box (the "warm cache" half).
     # ------------------------------------------------------------------
     - name: Run setup
       shell: bash
@@ -155,7 +229,11 @@ runs:
           "cd /workspace && ${{ steps.config.outputs.setup }}"
 
     # ------------------------------------------------------------------
-    # 6. Run the actual tests.
+    # 7. Run the actual tests.
+    #
+    # Tee output to /tmp/test-output.log so the failure-handling step
+    # can pull `failing_test` and `failure_log_tail` out of it for the
+    # CI context file.
     # ------------------------------------------------------------------
     - name: Run test
       shell: bash
@@ -164,11 +242,16 @@ runs:
         set -euo pipefail
         BOX="${{ steps.create.outputs.box-id }}"
         SSH_CFG="$HOME/.containarium/ssh_config"
+        # Pipe through tee but preserve the exit status of ssh via
+        # PIPESTATUS so a test failure still fails this step.
+        set -o pipefail
         ssh -F "$SSH_CFG" -o BatchMode=yes "$BOX" -- \
-          "cd /workspace && ${{ steps.config.outputs.test }}"
+          "cd /workspace && ${{ steps.config.outputs.test }}" \
+          2>&1 | tee /tmp/test-output.log
+        exit "${PIPESTATUS[0]}"
 
     # ------------------------------------------------------------------
-    # 7. If containarium.yml had a `serve:` block, expose it.
+    # 8. If containarium.yml had a `serve:` block, expose it.
     #    (Used for PR-preview environments — irrelevant for plain CI.)
     # ------------------------------------------------------------------
     - name: Expose port (if serve: defined)
@@ -191,7 +274,7 @@ runs:
         echo "url=$URL" >> "$GITHUB_OUTPUT"
 
     # ------------------------------------------------------------------
-    # 8. SUCCESS PATH — tear down the box.
+    # 9. SUCCESS PATH — tear down the box.
     # ------------------------------------------------------------------
     - name: Tear down box (success)
       shell: bash
@@ -205,7 +288,8 @@ runs:
         containarium delete "${{ steps.create.outputs.box-id }}" --yes
 
     # ------------------------------------------------------------------
-    # 9. FAILURE PATH — keep box alive, post debug PR comment.
+    # 10. FAILURE PATH — keep box alive, refresh CI context with
+    #     failing-test info, post debug PR comment.
     # ------------------------------------------------------------------
     - name: Keep box alive + post debug comment on failure
       shell: bash
@@ -219,6 +303,41 @@ runs:
       run: |
         set -euo pipefail
         BOX="${{ steps.create.outputs.box-id }}"
+        SSH_CFG="$HOME/.containarium/ssh_config"
+
+        # Refresh /workspace/.containarium/ci-context.json with what we
+        # learned from the test run — failing_test name + tail of output.
+        # Best-effort: if there's no test-output.log (e.g. setup itself
+        # failed) we skip the refresh and the create-time context is what
+        # the agent gets.
+        if [ -f /tmp/test-output.log ]; then
+          # Grab the last "FAIL:" / "--- FAIL:" / "FAIL " line and pull out
+          # what looks like a test name. Covers `go test` (--- FAIL: TestX),
+          # pytest (FAILED path::TestX), and generic "FAIL: name" output.
+          # If nothing matches we leave failing_test null rather than
+          # guessing — the agent can read failure_log_tail and figure it out.
+          FAILING_TEST=$(grep -E '(^|[[:space:]])(---[[:space:]]+)?FAIL(ED)?[:[:space:]]' /tmp/test-output.log \
+            | tail -n 1 \
+            | sed -E 's/.*FAIL(ED)?:?[[:space:]]+([^[:space:]]+).*/\2/' \
+            || true)
+          FAILURE_LOG_TAIL=$(tail -n 50 /tmp/test-output.log)
+
+          ssh -F "$SSH_CFG" -o BatchMode=yes "$BOX" -- \
+            "cat /workspace/.containarium/ci-context.json" > /tmp/ci-context.json.old || \
+            echo '{}' > /tmp/ci-context.json.old
+
+          jq \
+            --arg failing_test     "$FAILING_TEST" \
+            --arg failure_log_tail "$FAILURE_LOG_TAIL" \
+            '. + {
+              failing_test:     (if $failing_test     == "" then null else $failing_test     end),
+              failure_log_tail: (if $failure_log_tail == "" then null else $failure_log_tail end)
+            }' \
+            /tmp/ci-context.json.old > /tmp/ci-context.json
+
+          scp -F "$SSH_CFG" /tmp/ci-context.json "$BOX:/workspace/.containarium/ci-context.json" || true
+        fi
+
         # TODO: schedule auto-delete in 1h. Either via `containarium ttl set`
         # (new CLI verb needed) or via the Cloud API. Without this the box
         # leaks until manually deleted.

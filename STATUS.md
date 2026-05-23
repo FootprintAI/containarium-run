@@ -12,6 +12,9 @@ enumerates them so the team knows what to ship next.
 - Box naming convention (`ci-<repo>-<run-id>-<attempt>`)
 - SSH-based source push + setup/test execution (assumes a working
   `containarium ssh-config sync` against the configured `api-url`)
+- Drops `/workspace/.containarium/ci-context.json` into the box on
+  create + failure; agent-box upstream change exposes it as an MCP
+  resource (separate PR)
 
 ## In-flight upstream — `FootprintAI/containarium`
 
