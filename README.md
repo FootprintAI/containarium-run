@@ -92,6 +92,23 @@ The Cloud token issuance flow lives at
 [cloud.containarium.dev](https://cloud.containarium.dev); for self-hosted,
 issue your own tokens via the platform admin CLI.
 
+## Agent context (`.containarium/ci-context.json`)
+
+When the box is created, the action drops a small JSON file into
+`/workspace/.containarium/ci-context.json` describing the CI run that
+spawned it — repo, PR number/title/URL, commit SHA, branch, actor,
+GitHub run URL, workspace path. On failure, the same file is refreshed
+with the failing test name and the last ~50 lines of test output.
+
+The companion change to [agent-box](https://github.com/FootprintAI/containarium/tree/main/cmd/agent-box)
+exposes this file as an MCP resource (`containarium://ci-context`) so an agent
+connecting to a failing box has the full picture on its first turn —
+no "what am I looking at?" round-trip required.
+
+> The agent-box MCP-resource side ships as a separate upstream PR
+> against `FootprintAI/containarium`. Until that lands the file is
+> still on disk in the box and any agent can read it directly.
+
 ## Project home
 
 - Marketing site: [containarium.dev](https://containarium.dev)
