@@ -13,29 +13,25 @@ enumerates them so the team knows what to ship next.
 - SSH-based source push + setup/test execution (assumes a working
   `containarium ssh-config sync` against the configured `api-url`)
 
-## Blocked on upstream — `FootprintAI/containarium`
+## In-flight upstream — `FootprintAI/containarium`
 
-### 1. CLI-only install path
-`hacks/install.sh` installs CLI + daemon + Incus. CI runners only need
-the CLI binary. Need either:
-- a `hacks/install-cli.sh` that pulls only the CLI binary, or
-- direct download of pre-built CLI binaries from release artifacts at
-  a stable URL.
+### 1. CLI-only install path ✅ in [PR #295](https://github.com/FootprintAI/Containarium/pull/295)
+New `hacks/install-cli.sh` downloads just the CLI binary from the
+release. Release workflow already publishes `containarium-{linux,darwin}-{amd64,arm64}`
+assets at the standard URL, so the script is a ~50-line wrapper.
 
-The action.yml currently assumes
-`https://github.com/footprintai/containarium/releases/<version>/download/containarium-linux-amd64`
-exists; verify the release workflow publishes that asset name.
+### 2. Remote-targeting flags ✅ already existed (correction)
+Initial scoping was wrong on this one — the CLI already has `--server`
+/ `--token` / `--http` / `--insecure` / `--certs-dir` as PersistentFlags
+on root. [PR #295](https://github.com/FootprintAI/Containarium/pull/295)
+just adds env-var defaults (`CONTAINARIUM_SERVER`, `CONTAINARIUM_TOKEN`,
+etc.) so CI workflows don't repeat flags on every invocation.
 
-### 2. Remote-targeting flags on the CLI
-`containarium create`, `delete`, `ssh-config sync`, `expose-port` all
-currently target the local daemon (Unix socket). For Cloud / remote
-self-hosted, the CLI needs:
-- `--api-url <url>` (or `CONTAINARIUM_API_URL` env)
-- `--token <jwt>` (or `CONTAINARIUM_TOKEN` env)
+The action.yml should use `CONTAINARIUM_SERVER` (matching the existing
+flag), not `CONTAINARIUM_API_URL` — corrected in the same commit as
+this STATUS update.
 
-Without these the Action's `containarium create` calls go nowhere.
-
-### 3. Box TTL / auto-delete
+### 3. Box TTL / auto-delete — still missing
 The failure path is supposed to keep the box alive for 1h then auto-
 delete. The CLI has no `containarium ttl set <box> 1h` verb today;
 the box would leak indefinitely. Either:

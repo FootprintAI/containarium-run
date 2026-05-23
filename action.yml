@@ -20,8 +20,8 @@ branding:
   color: 'blue'
 
 inputs:
-  api-url:
-    description: 'Containarium API endpoint. Defaults to Containarium Cloud; point at https://your-host:8080 for self-hosted.'
+  server:
+    description: 'Containarium server address (matches the CLI''s --server flag and CONTAINARIUM_SERVER env var). Defaults to Containarium Cloud; point at https://your-host:8080 for self-hosted.'
     required: false
     default: 'https://api.containarium.dev'
   token:
@@ -59,19 +59,16 @@ runs:
     # ------------------------------------------------------------------
     - name: Install containarium CLI
       shell: bash
+      env:
+        CONTAINARIUM_VERSION: ${{ env.CONTAINARIUM_CLI_VERSION || 'latest' }}
       run: |
         set -euo pipefail
-        # The install.sh script in the OSS repo installs the daemon + CLI;
-        # for the Action we only need the CLI binary. Pull the released
-        # binary directly instead of running the full install.
-        # TODO: publish a CLI-only install path (`hacks/install-cli.sh`)
-        # in FootprintAI/containarium that skips the daemon bits.
-        # For now, fall back to grabbing the binary from the latest release.
-        VERSION="${CONTAINARIUM_CLI_VERSION:-latest}"
+        # install-cli.sh pulls just the CLI binary (no daemon, no Incus).
+        # Requires hacks/install-cli.sh on the FootprintAI/containarium
+        # main branch — see https://github.com/FootprintAI/Containarium/pull/295.
         curl -fsSL \
-          "https://github.com/footprintai/containarium/releases/${VERSION}/download/containarium-linux-amd64" \
-          -o /usr/local/bin/containarium
-        chmod +x /usr/local/bin/containarium
+          https://raw.githubusercontent.com/footprintai/containarium/main/hacks/install-cli.sh \
+          | sudo bash
         containarium --version
 
     # ------------------------------------------------------------------
@@ -108,8 +105,9 @@ runs:
       shell: bash
       id: create
       env:
-        CONTAINARIUM_API_URL: ${{ inputs.api-url }}
-        CONTAINARIUM_TOKEN:   ${{ inputs.token }}
+        CONTAINARIUM_HTTP:   'true'
+        CONTAINARIUM_SERVER: ${{ inputs.server }}
+        CONTAINARIUM_TOKEN:  ${{ inputs.token }}
       run: |
         set -euo pipefail
         BOX_NAME="ci-${GITHUB_REPOSITORY##*/}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -126,8 +124,9 @@ runs:
     - name: Push source to box
       shell: bash
       env:
-        CONTAINARIUM_API_URL: ${{ inputs.api-url }}
-        CONTAINARIUM_TOKEN:   ${{ inputs.token }}
+        CONTAINARIUM_HTTP:   'true'
+        CONTAINARIUM_SERVER: ${{ inputs.server }}
+        CONTAINARIUM_TOKEN:  ${{ inputs.token }}
       run: |
         set -euo pipefail
         BOX="${{ steps.create.outputs.box-id }}"
@@ -177,8 +176,9 @@ runs:
       id: expose
       if: steps.config.outputs.serve-port != ''
       env:
-        CONTAINARIUM_API_URL: ${{ inputs.api-url }}
-        CONTAINARIUM_TOKEN:   ${{ inputs.token }}
+        CONTAINARIUM_HTTP:   'true'
+        CONTAINARIUM_SERVER: ${{ inputs.server }}
+        CONTAINARIUM_TOKEN:  ${{ inputs.token }}
       run: |
         set -euo pipefail
         BOX="${{ steps.create.outputs.box-id }}"
@@ -197,8 +197,9 @@ runs:
       shell: bash
       if: success()
       env:
-        CONTAINARIUM_API_URL: ${{ inputs.api-url }}
-        CONTAINARIUM_TOKEN:   ${{ inputs.token }}
+        CONTAINARIUM_HTTP:   'true'
+        CONTAINARIUM_SERVER: ${{ inputs.server }}
+        CONTAINARIUM_TOKEN:  ${{ inputs.token }}
       run: |
         set -euo pipefail
         containarium delete "${{ steps.create.outputs.box-id }}" --yes
@@ -212,8 +213,9 @@ runs:
       if: failure() && inputs.keep-on-failure == 'true' && github.event_name == 'pull_request'
       env:
         GH_TOKEN: ${{ github.token }}
-        CONTAINARIUM_API_URL: ${{ inputs.api-url }}
-        CONTAINARIUM_TOKEN:   ${{ inputs.token }}
+        CONTAINARIUM_HTTP:   'true'
+        CONTAINARIUM_SERVER: ${{ inputs.server }}
+        CONTAINARIUM_TOKEN:  ${{ inputs.token }}
       run: |
         set -euo pipefail
         BOX="${{ steps.create.outputs.box-id }}"

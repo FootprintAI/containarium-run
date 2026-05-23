@@ -24,8 +24,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: FootprintAI/containarium-run@v0
         with:
-          api-url: ${{ secrets.CONTAINARIUM_API_URL }}
-          token:   ${{ secrets.CONTAINARIUM_TOKEN }}
+          server: ${{ secrets.CONTAINARIUM_SERVER }}
+          token:  ${{ secrets.CONTAINARIUM_TOKEN }}
 ```
 
 **`.github/containarium.yml`**
@@ -48,7 +48,7 @@ test:
 
 | Name | Required | Default | Description |
 |---|---|---|---|
-| `api-url` | No | `https://api.containarium.dev` | Containarium API endpoint. Point at your self-hosted instance if not using Cloud. |
+| `server` | No | `https://api.containarium.dev` | Containarium server address (matches CLI's `--server` flag / `CONTAINARIUM_SERVER` env var). Point at your self-hosted instance if not using Cloud. |
 | `token` | **Yes** | — | API token. Use a GitHub Actions secret. |
 | `config` | No | `.github/containarium.yml` | Path to the containarium config file in your repo. |
 | `cache-key` | No | — | *(v0: not yet implemented)* Cache key to reuse a warm box across runs (e.g. `${{ hashFiles('go.sum') }}`). |
@@ -84,8 +84,8 @@ Same Action, different `api-url`:
 ```yaml
 - uses: FootprintAI/containarium-run@v0
   with:
-    api-url: https://containarium.your-company.internal:8080
-    token:   ${{ secrets.CONTAINARIUM_TOKEN }}
+    server: https://containarium.your-company.internal:8080
+    token:  ${{ secrets.CONTAINARIUM_TOKEN }}
 ```
 
 The Cloud token issuance flow lives at
