@@ -1,13 +1,24 @@
 # containarium-run
 
-> **Status: v0 scaffold.** The action surface is the intended contract.
-> Several pieces require upstream changes in `FootprintAI/containarium`
-> and the Cloud API to fully work end-to-end — see [STATUS.md](STATUS.md).
+[![Release](https://img.shields.io/github/v/release/FootprintAI/containarium-run?label=release&color=indigo)](https://github.com/FootprintAI/containarium-run/releases)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Public — Tier 0 evaluators welcome](https://img.shields.io/badge/public-tier%200%20evaluators%20welcome-emerald)](https://containarium.dev/#ci)
 
 A GitHub Action that runs your CI tests inside a [Containarium](https://containarium.dev)
 box. Unlike GitHub-hosted runners, the box is a **real Linux container**
 you can SSH into, hand off to an agent, and keep alive on failure for
 post-mortem debugging.
+
+Pin to a release tag (`@v1`) rather than `@main`:
+
+```yaml
+- uses: FootprintAI/containarium-run@v1
+  with:
+    server: https://cloud.containarium.dev
+    token:  ${{ secrets.CONTAINARIUM_TOKEN }}
+```
+
+Don't have a token yet? See [containarium.dev/#ci](https://containarium.dev/#ci) for the 5-minute Tier 0 path (signup + mint a token at `cloud.containarium.dev/settings/api-tokens` + paste into a GitHub Secret).
 
 ## Quick start
 
@@ -22,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: FootprintAI/containarium-run@v0
+      - uses: FootprintAI/containarium-run@v1
         with:
           server: ${{ secrets.CONTAINARIUM_SERVER }}
           token:  ${{ secrets.CONTAINARIUM_TOKEN }}
@@ -51,7 +62,7 @@ test:
 | `server` | No | `https://cloud.containarium.dev` | Containarium server address (matches CLI's `--server` flag / `CONTAINARIUM_SERVER` env var). Point at your self-hosted instance if not using Cloud. |
 | `token` | **Yes** | — | API token. Use a GitHub Actions secret. |
 | `config` | No | `.github/containarium.yml` | Path to the containarium config file in your repo. |
-| `cache-key` | No | — | *(v0: not yet implemented)* Cache key to reuse a warm box across runs (e.g. `${{ hashFiles('go.sum') }}`). |
+| `cache-key` | No | — | *(planned; not in v1)* Cache key to reuse a warm box across runs (e.g. `${{ hashFiles('go.sum') }}`). |
 | `keep-on-failure` | No | `true` | On test failure, keep box alive 1h and post a debug comment on the PR. |
 
 ## Outputs
@@ -62,7 +73,7 @@ test:
 | `preview-url` | when `serve:` block defined | Public URL of the served app. |
 | `debug-url` | on failure with `keep-on-failure: true` | Agent-box MCP URL for interactive debugging. |
 
-## `containarium.yml` schema (v0)
+## `containarium.yml` schema
 
 ```yaml
 image: ubuntu-24.04          # required — base image
@@ -75,14 +86,14 @@ serve:                       # optional — for PR preview environments
   port: <int>
 ```
 
-Three fields (plus the optional `serve:`). Resist adding a fourth in v1
-unless the use case is universal.
+Three fields (plus the optional `serve:`). Resist adding a fourth in
+v1.x unless the use case is universal.
 
 ## Self-hosted
 
 Same Action, different `api-url`:
 ```yaml
-- uses: FootprintAI/containarium-run@v0
+- uses: FootprintAI/containarium-run@v1
   with:
     server: https://containarium.your-company.internal:8080
     token:  ${{ secrets.CONTAINARIUM_TOKEN }}
@@ -100,14 +111,13 @@ spawned it — repo, PR number/title/URL, commit SHA, branch, actor,
 GitHub run URL, workspace path. On failure, the same file is refreshed
 with the failing test name and the last ~50 lines of test output.
 
-The companion change to [agent-box](https://github.com/FootprintAI/containarium/tree/main/cmd/agent-box)
+The companion [agent-box](https://github.com/FootprintAI/containarium/tree/main/cmd/agent-box)
 exposes this file as an MCP resource (`containarium://ci-context`) so an agent
 connecting to a failing box has the full picture on its first turn —
-no "what am I looking at?" round-trip required.
-
-> The agent-box MCP-resource side ships as a separate upstream PR
-> against `FootprintAI/containarium`. Until that lands the file is
-> still on disk in the box and any agent can read it directly.
+no "what am I looking at?" round-trip required. A second resource
+(`containarium://ci-prompt`) provides an opinionated playbook for
+debugging failing CI runs inside Containarium boxes — read alongside
+the context.
 
 ## Project home
 
