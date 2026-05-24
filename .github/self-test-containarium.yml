@@ -1,0 +1,18 @@
+# Minimal config for the self-test workflow.
+#
+# The self-test exercises only the action-load phase (see
+# .github/workflows/self-test.yml). The action's runtime steps will
+# fail downstream of load because the server in the test is
+# intentionally unreachable. That's fine — the test asserts on load,
+# not on full end-to-end.
+#
+# Keep this file minimal: any expansion of the containarium.yml
+# schema in action.yml's parser path should still accept this file
+# as valid, so we can detect schema-mismatch regressions here too.
+
+image: ubuntu-24.04
+
+setup: []
+
+test:
+  - 'echo if-we-get-here-the-config-loaded-too'
