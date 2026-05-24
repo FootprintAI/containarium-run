@@ -91,12 +91,48 @@ runs:
           echo "::error::config file not found: $CFG"
           exit 1
         fi
-        # yq is preinstalled on ubuntu-latest runners.
-        IMAGE=$(yq -r '.image // "ubuntu-24.04"' "$CFG")
-        SETUP=$(yq -r '.setup // [] | join(" && ")' "$CFG")
-        TEST=$(yq -r '.test  // [] | join(" && ")' "$CFG")
-        SERVE_CMD=$(yq -r '.serve.command // ""' "$CFG")
-        SERVE_PORT=$(yq -r '.serve.port // ""' "$CFG")
+        # Parse via python3 + PyYAML — both are present on every Linux
+        # runner GitHub Actions supports (ubuntu-latest preinstalls
+        # PyYAML; self-hosted runners with a base ubuntu/debian image
+        # have python3-yaml in apt). This avoids the yq prerequisite
+        # that bit us on self-hosted boxes (Containarium-cloud CI:
+        # `yq: command not found`, exit 127, before any box was
+        # created — the failure-handling step's debug comment came
+        # through but with an empty BOX, so useless).
+        #
+        # The yaml→json→shell-var bridge keeps the heredoc-into-
+        # $GITHUB_OUTPUT shape (no quoting / escape headaches for
+        # multi-line setup/test scripts).
+        eval "$(python3 - "$CFG" <<'PY'
+        import json, shlex, sys
+        try:
+            import yaml
+        except ImportError:
+            print('echo "::error::python3 yaml module missing; apt-get install python3-yaml on the runner"; exit 1')
+            sys.exit(0)
+        with open(sys.argv[1]) as f:
+            d = yaml.safe_load(f) or {}
+        def join_cmds(x):
+            if not x: return ""
+            if isinstance(x, str): return x
+            if isinstance(x, list): return " && ".join(str(c) for c in x)
+            return ""
+        image      = d.get("image") or "ubuntu-24.04"
+        setup      = join_cmds(d.get("setup"))
+        test_cmd   = join_cmds(d.get("test"))
+        serve      = d.get("serve") or {}
+        serve_cmd  = serve.get("command", "") if isinstance(serve, dict) else ""
+        serve_port = serve.get("port", "")    if isinstance(serve, dict) else ""
+        for var, val in [
+            ("IMAGE",      image),
+            ("SETUP",      setup),
+            ("TEST",       test_cmd),
+            ("SERVE_CMD",  serve_cmd),
+            ("SERVE_PORT", str(serve_port) if serve_port != "" else ""),
+        ]:
+            print(f"{var}={shlex.quote(str(val))}")
+        PY
+        )"
         {
           echo "image=$IMAGE"
           echo "setup<<EOF"; echo "$SETUP"; echo "EOF"
