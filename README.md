@@ -48,7 +48,7 @@ test:
 
 | Name | Required | Default | Description |
 |---|---|---|---|
-| `server` | No | `https://api.containarium.dev` | Containarium server address (matches CLI's `--server` flag / `CONTAINARIUM_SERVER` env var). Point at your self-hosted instance if not using Cloud. |
+| `server` | No | `https://cloud.containarium.dev` | Containarium server address (matches CLI's `--server` flag / `CONTAINARIUM_SERVER` env var). Point at your self-hosted instance if not using Cloud. |
 | `token` | **Yes** | — | API token. Use a GitHub Actions secret. |
 | `config` | No | `.github/containarium.yml` | Path to the containarium config file in your repo. |
 | `cache-key` | No | — | *(v0: not yet implemented)* Cache key to reuse a warm box across runs (e.g. `${{ hashFiles('go.sum') }}`). |

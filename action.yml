@@ -23,7 +23,7 @@ inputs:
   server:
     description: 'Containarium server address (matches the CLI''s --server flag and CONTAINARIUM_SERVER env var). Defaults to Containarium Cloud; point at https://your-host:8080 for self-hosted.'
     required: false
-    default: 'https://api.containarium.dev'
+    default: 'https://cloud.containarium.dev'
   token:
     description: 'API token (use a GitHub secret).'
     required: true
