@@ -1,0 +1,75 @@
+# self-test — catch action.yml load failures BEFORE downstream users do.
+#
+# Why this exists: we shipped a v1 release that couldn't be loaded by
+# GitHub Actions at all (PR #5 fixed two parse errors: `${{ hashFiles() }}`
+# in an input description, and an unquoted `:` inside parens in a step
+# name). Both bugs only surfaced when a real workflow tried to consume
+# the Action — neither showed up in PyYAML or buf-lint, and we had no
+# CI of our own. This workflow closes that gap.
+#
+# Two jobs:
+#
+#   1. actionlint  — static check that catches most action.yml shape
+#                    issues (and is fast: ~5s)
+#   2. load        — uses the Action against itself; if action.yml
+#                    fails to load, the `uses: ./` step fails before
+#                    any downstream step can run. The fact that the
+#                    "Reached post-uses step" check runs at all is the
+#                    proof that loading succeeded.
+#
+# We DELIBERATELY do not run the Action end-to-end here — the actual
+# runtime path needs a real Containarium token + reachable server,
+# which we don't want in self-test secrets. Runtime correctness is
+# validated by the dogfood deployment in Containarium-cloud's CI.
+
+name: self-test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  actionlint:
+    name: actionlint (static check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: actionlint
+        uses: docker://rhysd/actionlint:latest
+        with:
+          args: -color action.yml
+
+  load:
+    name: action.yml loads (catches GHA-specific parse errors)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load action.yml via uses-./-
+        # If action.yml fails to load (e.g. an unrecognized function
+        # like `hashFiles()` in an input description that GHA tries to
+        # evaluate, or an unquoted `:` in a step name that breaks the
+        # YAML mapping parser), THIS step fails. continue-on-error
+        # does NOT help — action-load happens before that field takes
+        # effect; a load failure halts the job regardless.
+        #
+        # We expect this step to fail at runtime (the server is
+        # unreachable on purpose), but NOT to fail at load. The
+        # downstream "Reached post-uses step" assertion below proves
+        # loading succeeded.
+        uses: ./
+        with:
+          server: 'http://127.0.0.1:1'
+          token: 'ctnr_self-test-fake-token-no-real-auth'
+          config: '.github/self-test-containarium.yml'
+          keep-on-failure: 'false'
+        continue-on-error: true
+
+      - name: Reached post-uses step (proves action loaded)
+        run: |
+          echo "✓ action.yml loaded successfully — uses-./- got past the load phase."
+          echo "  Runtime failures inside the action (auth, server unreachable, etc.)"
+          echo "  are expected and ignored. The thing we're guarding against is"
+          echo "  load failures that block ALL consumers."
