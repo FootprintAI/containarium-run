@@ -9,13 +9,22 @@
 #
 # Two jobs:
 #
-#   1. actionlint  — static check that catches most action.yml shape
-#                    issues (and is fast: ~5s)
+#   1. yaml-syntax — runs PyYAML on action.yml. Catches plain YAML
+#                    syntax errors like the unquoted `:` in a step
+#                    name that broke load before PR #5. Fast (~2s).
+#                    Doesn't validate GHA-specific schema; that's
+#                    the runtime job's job.
 #   2. load        — uses the Action against itself; if action.yml
 #                    fails to load, the `uses: ./` step fails before
 #                    any downstream step can run. The fact that the
 #                    "Reached post-uses step" check runs at all is the
 #                    proof that loading succeeded.
+#
+# (We initially tried `rhysd/actionlint` as the static check but
+# actionlint is for *workflow* files, not *action* files — different
+# schema. It misinterpreted action.yml as a workflow and complained
+# about missing `on:` / `jobs:` sections. Wrong tool. PyYAML is
+# narrower but actually applicable.)
 #
 # We DELIBERATELY do not run the Action end-to-end here — the actual
 # runtime path needs a real Containarium token + reachable server,
@@ -31,15 +40,23 @@ on:
   workflow_dispatch:
 
 jobs:
-  actionlint:
-    name: actionlint (static check)
+  yaml-syntax:
+    name: YAML syntax (PyYAML)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: actionlint
-        uses: docker://rhysd/actionlint:latest
-        with:
-          args: -color action.yml
+      - name: Parse action.yml + fixtures with PyYAML
+        run: |
+          python3 -c "
+          import sys, yaml
+          for f in ['action.yml', '.github/self-test-containarium.yml']:
+              try:
+                  yaml.safe_load(open(f))
+                  print(f'ok: {f}')
+              except yaml.YAMLError as e:
+                  print(f'FAIL: {f}: {e}', file=sys.stderr)
+                  sys.exit(1)
+          "
 
   load:
     name: action.yml loads (catches GHA-specific parse errors)
