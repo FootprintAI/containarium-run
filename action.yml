@@ -32,7 +32,11 @@ inputs:
     required: false
     default: '.github/containarium.yml'
   cache-key:
-    description: 'Optional cache key to reuse a warm box volume across runs (e.g. ${{ hashFiles(''go.sum'') }}). v0: not yet implemented — set but ignored.'
+    # Plain text only — GHA evaluates ${{ }} expressions in input
+    # descriptions, and hashFiles() is a workflow-context function not
+    # available at action-load time. Document the recommended caller
+    # usage in prose instead of demonstrating it inline.
+    description: 'Optional cache key to reuse a warm box volume across runs. Callers typically pass hashFiles of their lockfile (e.g. hashFiles for go.sum or package-lock.json) via the workflow expression. Not yet implemented — set but ignored.'
     required: false
     default: ''
   keep-on-failure:
@@ -254,7 +258,7 @@ runs:
     # 8. If containarium.yml had a `serve:` block, expose it.
     #    (Used for PR-preview environments — irrelevant for plain CI.)
     # ------------------------------------------------------------------
-    - name: Expose port (if serve: defined)
+    - name: 'Expose port (if serve block defined)'
       shell: bash
       id: expose
       if: steps.config.outputs.serve-port != ''
