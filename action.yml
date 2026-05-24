@@ -73,7 +73,10 @@ runs:
         curl -fsSL \
           https://raw.githubusercontent.com/footprintai/containarium/main/hacks/install-cli.sh \
           | sudo bash
-        containarium --version
+        # The CLI exposes its version via a subcommand, not a top-level
+        # --version flag (different from the `containarium` daemon, which
+        # accepts both).
+        containarium version
 
     # ------------------------------------------------------------------
     # 2. Parse the user's containarium.yml.
