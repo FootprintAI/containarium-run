@@ -355,7 +355,13 @@ runs:
         echo "url=$MCP_URL" >> "$GITHUB_OUTPUT"
         # TODO: sticky-comment behavior — find existing containarium-bot
         # comment on this PR and edit it instead of posting a new one.
-        gh pr comment "${{ github.event.pull_request.number }}" --body "$(cat <<EOF
+        #
+        # Post via gh CLI when available, else fall back to GitHub's
+        # REST API directly. Many self-hosted runners don't ship gh —
+        # falling back to curl keeps debug-on-failure visibility working
+        # on any runner with bash + curl + jq. (jq is already a hard
+        # dep — earlier steps use it to build ci-context.json.)
+        BODY=$(cat <<EOF
         ### ❌ CI failed — box kept alive for debugging
 
         **Debug this box live** (expires in 60 minutes)
@@ -371,4 +377,17 @@ runs:
 
         Posted by [containarium-run](https://github.com/FootprintAI/containarium-run) · commit \`${GITHUB_SHA:0:7}\`
         EOF
-        )"
+        )
+        PR_NUM="${{ github.event.pull_request.number }}"
+        if command -v gh >/dev/null 2>&1; then
+          gh pr comment "$PR_NUM" --body "$BODY"
+        else
+          # GH_TOKEN env above carries github.token; same auth as gh.
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/${PR_NUM}/comments" \
+            -d "$(jq -nc --arg body "$BODY" '{body: $body}')" \
+            >/dev/null
+        fi
