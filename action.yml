@@ -176,7 +176,14 @@ runs:
         CONTAINARIUM_TOKEN:  ${{ inputs.token }}
       run: |
         set -euo pipefail
-        BOX_NAME="ci-${GITHUB_REPOSITORY##*/}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        # Box name must satisfy the daemon's jump-server username
+        # validator: [a-zA-Z0-9_-], 1-32 chars, can't start with a
+        # digit or dash. Concatenating GITHUB_REPOSITORY##*/ (e.g.
+        # "Containarium-cloud") + GITHUB_RUN_ID (19 digits) +
+        # GITHUB_RUN_ATTEMPT easily blows past 32 chars and create
+        # rejects the box. GITHUB_RUN_ID is globally unique already;
+        # the repo prefix was just for human readability.
+        BOX_NAME="ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
         # TODO: containarium create currently targets the local daemon.
         # The CLI needs `--api-url` + `--token` flags (or env-var honoring)
         # to talk to remote Cloud / self-hosted endpoints. Track at
