@@ -142,7 +142,30 @@ runs:
         } >> "$GITHUB_OUTPUT"
 
     # ------------------------------------------------------------------
-    # 3. Create the box.
+    # 3a. Generate a throwaway SSH keypair for this CI run.
+    #
+    # `containarium create` REQUIRES --ssh-key (the CLI rejects calls
+    # without one — "Error: required flag(s) "ssh-key" not set"). The
+    # action can't carry a long-lived key, so we mint a fresh ed25519
+    # pair per run, pass the pubkey at create time, and use the
+    # privkey for the subsequent ssh / rsync / scp calls.
+    #
+    # Both files land under $RUNNER_TEMP (cleaned up by GHA at the
+    # end of the job). The privkey is mode 0600 so ssh accepts it.
+    # ------------------------------------------------------------------
+    - name: Mint per-run SSH keypair
+      shell: bash
+      id: sshkey
+      run: |
+        set -euo pipefail
+        KEY="${RUNNER_TEMP}/containarium-ci-key"
+        ssh-keygen -t ed25519 -N "" -f "$KEY" -C "containarium-ci-${GITHUB_RUN_ID}" -q
+        chmod 600 "$KEY"
+        echo "priv=$KEY" >> "$GITHUB_OUTPUT"
+        echo "pub=${KEY}.pub" >> "$GITHUB_OUTPUT"
+
+    # ------------------------------------------------------------------
+    # 3b. Create the box.
     # ------------------------------------------------------------------
     - name: Create Containarium box
       shell: bash
@@ -158,11 +181,20 @@ runs:
         # The CLI needs `--api-url` + `--token` flags (or env-var honoring)
         # to talk to remote Cloud / self-hosted endpoints. Track at
         # FootprintAI/containarium#TODO.
-        containarium create "$BOX_NAME" --image "${{ steps.config.outputs.image }}"
+        containarium create "$BOX_NAME" \
+          --image "${{ steps.config.outputs.image }}" \
+          --ssh-key "${{ steps.sshkey.outputs.pub }}"
         echo "box-id=$BOX_NAME" >> "$GITHUB_OUTPUT"
 
     # ------------------------------------------------------------------
     # 4. Push source code into the box.
+    #
+    # Uses the per-run privkey from step 3a directly, bypassing
+    # `containarium ssh-config sync` (which is meant for ad-hoc
+    # persistent users + a long-lived ~/.ssh/id_ed25519 — not a CI
+    # one-shot). StrictHostKeyChecking=accept-new pins the host's
+    # key on first connect; subsequent steps in the same job reuse
+    # the same known_hosts entry.
     # ------------------------------------------------------------------
     - name: Push source to box
       shell: bash
@@ -173,15 +205,12 @@ runs:
       run: |
         set -euo pipefail
         BOX="${{ steps.create.outputs.box-id }}"
-        # ssh-config sync writes ~/.containarium/ssh_config; we point ssh/rsync
-        # at it directly without touching ~/.ssh/config.
-        containarium ssh-config sync
-        SSH_CFG="$HOME/.containarium/ssh_config"
+        SSH_KEY="${{ steps.sshkey.outputs.priv }}"
         # TODO: pick a stable workdir convention for CI runs (e.g. /workspace).
         # Confirm the box's default user has write access there, or chown on
         # first push.
         rsync -az --delete \
-          -e "ssh -F $SSH_CFG -o StrictHostKeyChecking=accept-new -o BatchMode=yes" \
+          -e "ssh -i $SSH_KEY -o StrictHostKeyChecking=accept-new -o BatchMode=yes" \
           ./ "$BOX:/workspace/"
 
     # ------------------------------------------------------------------
@@ -202,7 +231,7 @@ runs:
       run: |
         set -euo pipefail
         BOX="${{ steps.create.outputs.box-id }}"
-        SSH_CFG="$HOME/.containarium/ssh_config"
+        SSH_KEY="${{ steps.sshkey.outputs.priv }}"
 
         # Pull PR-specific fields out of the event payload when this is a
         # pull_request event; on push events they stay null and jq omits
@@ -255,8 +284,8 @@ runs:
           }' \
           > /tmp/ci-context.json
 
-        ssh -F "$SSH_CFG" -o BatchMode=yes "$BOX" -- "mkdir -p /workspace/.containarium"
-        scp -F "$SSH_CFG" /tmp/ci-context.json "$BOX:/workspace/.containarium/ci-context.json"
+        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o BatchMode=yes "$BOX" -- "mkdir -p /workspace/.containarium"
+        scp -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new /tmp/ci-context.json "$BOX:/workspace/.containarium/ci-context.json"
 
     # ------------------------------------------------------------------
     # 6. Run setup commands inside the box (the "warm cache" half).
@@ -267,8 +296,8 @@ runs:
       run: |
         set -euo pipefail
         BOX="${{ steps.create.outputs.box-id }}"
-        SSH_CFG="$HOME/.containarium/ssh_config"
-        ssh -F "$SSH_CFG" -o BatchMode=yes "$BOX" -- \
+        SSH_KEY="${{ steps.sshkey.outputs.priv }}"
+        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o BatchMode=yes "$BOX" -- \
           "cd /workspace && ${{ steps.config.outputs.setup }}"
 
     # ------------------------------------------------------------------
@@ -284,11 +313,11 @@ runs:
       run: |
         set -euo pipefail
         BOX="${{ steps.create.outputs.box-id }}"
-        SSH_CFG="$HOME/.containarium/ssh_config"
+        SSH_KEY="${{ steps.sshkey.outputs.priv }}"
         # Pipe through tee but preserve the exit status of ssh via
         # PIPESTATUS so a test failure still fails this step.
         set -o pipefail
-        ssh -F "$SSH_CFG" -o BatchMode=yes "$BOX" -- \
+        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o BatchMode=yes "$BOX" -- \
           "cd /workspace && ${{ steps.config.outputs.test }}" \
           2>&1 | tee /tmp/test-output.log
         exit "${PIPESTATUS[0]}"
@@ -308,9 +337,9 @@ runs:
       run: |
         set -euo pipefail
         BOX="${{ steps.create.outputs.box-id }}"
-        SSH_CFG="$HOME/.containarium/ssh_config"
+        SSH_KEY="${{ steps.sshkey.outputs.priv }}"
         # Start the serve command in the background inside the box.
-        ssh -F "$SSH_CFG" -o BatchMode=yes "$BOX" -- \
+        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o BatchMode=yes "$BOX" -- \
           "cd /workspace && nohup ${{ steps.config.outputs.serve-cmd }} >/tmp/serve.log 2>&1 &"
         # Expose the port — the CLI prints the public URL on success.
         URL=$(containarium expose-port "$BOX" --port "${{ steps.config.outputs.serve-port }}" --output url)
@@ -346,7 +375,7 @@ runs:
       run: |
         set -euo pipefail
         BOX="${{ steps.create.outputs.box-id }}"
-        SSH_CFG="$HOME/.containarium/ssh_config"
+        SSH_KEY="${{ steps.sshkey.outputs.priv }}"
 
         # Refresh /workspace/.containarium/ci-context.json with what we
         # learned from the test run — failing_test name + tail of output.
@@ -365,7 +394,7 @@ runs:
             || true)
           FAILURE_LOG_TAIL=$(tail -n 50 /tmp/test-output.log)
 
-          ssh -F "$SSH_CFG" -o BatchMode=yes "$BOX" -- \
+          ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o BatchMode=yes "$BOX" -- \
             "cat /workspace/.containarium/ci-context.json" > /tmp/ci-context.json.old || \
             echo '{}' > /tmp/ci-context.json.old
 
@@ -378,7 +407,7 @@ runs:
             }' \
             /tmp/ci-context.json.old > /tmp/ci-context.json
 
-          scp -F "$SSH_CFG" /tmp/ci-context.json "$BOX:/workspace/.containarium/ci-context.json" || true
+          scp -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new /tmp/ci-context.json "$BOX:/workspace/.containarium/ci-context.json" || true
         fi
 
         # TODO: schedule auto-delete in 1h. Either via `containarium ttl set`
