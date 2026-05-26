@@ -43,6 +43,17 @@ inputs:
     description: 'On failure, keep the box alive for 1h and post a PR comment with SSH + MCP debug URLs.'
     required: false
     default: 'true'
+  org-id:
+    # Optional for v0: when set, the runner reports debug-box metadata
+    # back to the cloud's CI dashboard on test failure (powers the
+    # FailureDebugSurface panel on /ci/runs/<id>). Skip when empty —
+    # no cloud reporting attempted, preserves backwards-compat for
+    # users who haven't run the onboarding wizard yet (the wizard
+    # will eventually write this as a repo variable alongside
+    # CONTAINARIUM_TOKEN; for now operators set it manually).
+    description: 'Cloud org id (UUID). Optional; when set, debug-box info is reported back to the cloud dashboard on failure. Find it under /settings or by inspecting an existing /v1/orgs/{org}/... URL while signed in.'
+    required: false
+    default: ''
 
 outputs:
   box-id:
@@ -463,3 +474,101 @@ runs:
             -d "$(jq -nc --arg body "$BODY" '{body: $body}')" \
             >/dev/null
         fi
+
+        # Expose the SSH connection bits the next step (report-runtime)
+        # needs. The PR comment above bakes them into a markdown
+        # one-liner; the cloud's CI dashboard wants the structured
+        # fields so it can render its own panel without parsing
+        # markdown back out. Both flow from the same source so they
+        # stay in sync.
+        echo "ssh-host=${BOX}.boxes.containarium.dev" >> "$GITHUB_OUTPUT"
+        echo "ssh-port=2222"                          >> "$GITHUB_OUTPUT"
+        echo "ssh-user=debug"                         >> "$GITHUB_OUTPUT"
+        echo "mcp-url=$MCP_URL"                       >> "$GITHUB_OUTPUT"
+
+    # ------------------------------------------------------------------
+    # 11. FAILURE PATH (continued) — report the kept-alive box back to
+    #     the cloud dashboard so the FailureDebugSurface panel renders
+    #     real connection info rather than the "Coming soon" stub.
+    #
+    # Skipped (with a notice in the log, not a failure) when:
+    #   - org-id is empty (operator hasn't wired it up)
+    #   - the PR-comment step itself was skipped (no debug box to report)
+    #
+    # Best-effort: a 404 from the cloud (e.g. webhook hasn't yet
+    # inserted the ci_jobs row) does NOT fail the workflow. The cloud
+    # only knows about runs it has webhook-ingested; if we're racing
+    # the webhook we accept that the dashboard panel may take a
+    # follow-up wizard refresh to show the box. Logs the response
+    # body either way so debugging is straightforward from the
+    # Actions log.
+    # ------------------------------------------------------------------
+    - name: Report debug box to cloud dashboard
+      shell: bash
+      if: failure() && inputs.keep-on-failure == 'true' && github.event_name == 'pull_request' && inputs.org-id != ''
+      env:
+        CONTAINARIUM_SERVER: ${{ inputs.server }}
+        CONTAINARIUM_TOKEN:  ${{ inputs.token }}
+        ORG_ID:    ${{ inputs.org-id }}
+        SSH_HOST:  ${{ steps.debug.outputs.ssh-host }}
+        SSH_PORT:  ${{ steps.debug.outputs.ssh-port }}
+        SSH_USER:  ${{ steps.debug.outputs.ssh-user }}
+        MCP_URL:   ${{ steps.debug.outputs.mcp-url }}
+      run: |
+        set -euo pipefail
+        # Skip silently when the debug step didn't run (e.g. failure
+        # before box was up). steps.debug.outputs.ssh-host is empty
+        # in that case.
+        if [ -z "${SSH_HOST:-}" ]; then
+          echo "no debug box to report (debug step didn't run); skipping"
+          exit 0
+        fi
+        # Keep-alive window matches the PR-comment claim ("expires in
+        # 60 minutes"). Compute as an RFC-3339 timestamp the cloud's
+        # google.protobuf.Timestamp parser accepts directly.
+        KEEP_UNTIL=$(date -u -d '+60 minutes' '+%Y-%m-%dT%H:%M:%SZ')
+
+        # POST shape mirrors ReportCIJobRuntimeRequest in
+        # proto/containarium/cloud/v1/ci_service.proto. container_id
+        # is omitted ('' on the wire) — the OSS CLI doesn't yet
+        # surface the cloud's container UUID; that wiring lands in a
+        # follow-up. Debug box is what powers the C4 panel today.
+        BODY=$(jq -nc \
+          --arg org    "$ORG_ID" \
+          --arg run    "$GITHUB_RUN_ID" \
+          --arg job    "$GITHUB_JOB" \
+          --arg host   "$SSH_HOST" \
+          --argjson port "$SSH_PORT" \
+          --arg user   "$SSH_USER" \
+          --arg mcp    "$MCP_URL" \
+          --arg until_ "$KEEP_UNTIL" \
+          '{
+            org_id:        $org,
+            github_run_id: ($run | tonumber),
+            job_name:      $job,
+            container_id:  "",
+            debug_box: {
+              ssh_host:         $host,
+              ssh_port:         $port,
+              ssh_user:         $user,
+              mcp_url:          $mcp,
+              keep_alive_until: $until_
+            }
+          }')
+
+        URL="${CONTAINARIUM_SERVER%/}/v1/orgs/${ORG_ID}/ci/runs/${GITHUB_RUN_ID}/jobs/${GITHUB_JOB}:report-runtime"
+        # --max-time guards against the runner hanging if the cloud
+        # is slow / down — failure-path step shouldn't block job
+        # completion for more than a few seconds.
+        HTTP_CODE=$(curl -sS -o /tmp/report-runtime.out -w '%{http_code}' \
+          --max-time 10 \
+          -X POST "$URL" \
+          -H "Authorization: Bearer ${CONTAINARIUM_TOKEN}" \
+          -H 'Content-Type: application/json' \
+          -d "$BODY" \
+          || echo "curl-failed")
+        echo "report-runtime: $HTTP_CODE"
+        cat /tmp/report-runtime.out || true
+        # Don't fail the step on any cloud-side response — the user
+        # already has the SSH/MCP info in the PR comment; the
+        # dashboard panel is nice-to-have, not load-bearing.

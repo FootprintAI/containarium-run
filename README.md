@@ -64,6 +64,7 @@ test:
 | `config` | No | `.github/containarium.yml` | Path to the containarium config file in your repo. |
 | `cache-key` | No | — | *(planned; not in v1)* Cache key to reuse a warm box across runs (e.g. `${{ hashFiles('go.sum') }}`). |
 | `keep-on-failure` | No | `true` | On test failure, keep box alive 1h and post a debug comment on the PR. |
+| `org-id` | No | — | Cloud org UUID. When set, debug-box endpoint info (SSH host/port/user, MCP URL, keep-alive deadline) is reported back to the cloud's CI dashboard on test failure so the `/ci/runs/<id>` panel renders real connection info. Skipped silently when empty — preserves backwards-compat for users who haven't run the onboarding wizard. |
 
 ## Outputs
 
