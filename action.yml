@@ -54,6 +54,17 @@ inputs:
     description: 'Cloud org id (UUID). Optional; when set, debug-box info is reported back to the cloud dashboard on failure. Find it under /settings or by inspecting an existing /v1/orgs/{org}/... URL while signed in.'
     required: false
     default: ''
+  preview-domain:
+    # The PR-preview hostname the action passes to `containarium
+    # expose-port --domain`. Required by the CLI; caller-supplied
+    # so the hostname pattern is template-friendly (e.g.
+    # `pr-${{ github.event.pull_request.number }}.previews.example.com`).
+    # When empty AND the user's containarium.yml has a `serve:` block,
+    # the expose step is skipped with a clear log line — same posture
+    # as `org-id`. See https://github.com/FootprintAI/containarium-run/issues/13.
+    description: 'Public hostname to route to the container when containarium.yml has a serve: block (e.g. pr-42.previews.example.com). Required when serve is defined; skipped otherwise.'
+    required: false
+    default: ''
 
 outputs:
   box-id:
@@ -352,6 +363,8 @@ runs:
         CONTAINARIUM_HTTP:   'true'
         CONTAINARIUM_SERVER: ${{ inputs.server }}
         CONTAINARIUM_TOKEN:  ${{ inputs.token }}
+        PREVIEW_DOMAIN: ${{ inputs.preview-domain }}
+        SERVE_PORT: ${{ steps.config.outputs.serve-port }}
       run: |
         set -euo pipefail
         BOX="${{ steps.create.outputs.box-id }}"
@@ -359,9 +372,32 @@ runs:
         # Start the serve command in the background inside the box.
         ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o BatchMode=yes "$BOX" -- \
           "cd /workspace && nohup ${{ steps.config.outputs.serve-cmd }} >/tmp/serve.log 2>&1 &"
-        # Expose the port — the CLI prints the public URL on success.
-        URL=$(containarium expose-port "$BOX" --port "${{ steps.config.outputs.serve-port }}" --output url)
-        echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+        # Skip the actual expose if the caller didn't provide a
+        # preview-domain — same posture as the org-id gate on the
+        # debug-box reporter. The serve command still runs inside the
+        # box (above) so the operator can SSH in to test, but the
+        # public hostname requires explicit caller intent.
+        # See https://github.com/FootprintAI/containarium-run/issues/13.
+        if [ -z "${PREVIEW_DOMAIN:-}" ]; then
+          echo "skipping expose-port: preview-domain input is empty."
+          echo "  Pass `preview-domain: pr-\${{ github.event.pull_request.number }}.previews.example.com` (or similar)"
+          echo "  on the containarium-run step to enable PR-preview hostnames."
+          echo "url=" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # CLI flag surface (per internal/cmd/expose_port.go in
+        # FootprintAI/Containarium):
+        #   containarium expose-port <username> --container-port N --domain HOST
+        # No `--output url` flag exists; the URL the caller composes
+        # from preview-domain is the URL (the CLI just wires the
+        # proxy route to it).
+        containarium expose-port "$BOX" \
+          --container-port "$SERVE_PORT" \
+          --domain "$PREVIEW_DOMAIN"
+
+        echo "url=https://$PREVIEW_DOMAIN" >> "$GITHUB_OUTPUT"
 
     # ------------------------------------------------------------------
     # 9. SUCCESS PATH — tear down the box.

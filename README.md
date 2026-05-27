@@ -65,6 +65,7 @@ test:
 | `cache-key` | No | — | *(planned; not in v1)* Cache key to reuse a warm box across runs (e.g. `${{ hashFiles('go.sum') }}`). |
 | `keep-on-failure` | No | `true` | On test failure, keep box alive 1h and post a debug comment on the PR. |
 | `org-id` | No | — | Cloud org UUID. When set, debug-box endpoint info (SSH host/port/user, MCP URL, keep-alive deadline) is reported back to the cloud's CI dashboard on test failure so the `/ci/runs/<id>` panel renders real connection info. Skipped silently when empty — preserves backwards-compat for users who haven't run the onboarding wizard. |
+| `preview-domain` | No | — | Public hostname to route to the container when `containarium.yml` has a `serve:` block (e.g. `pr-${{ github.event.pull_request.number }}.previews.example.com`). Required by the CLI; when empty, the expose step is skipped with a log line (the serve command still runs inside the box, but no public route is wired). See [#13](https://github.com/FootprintAI/containarium-run/issues/13) for the design discussion. |
 
 ## Outputs
 
