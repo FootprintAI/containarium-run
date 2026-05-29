@@ -235,12 +235,17 @@ runs:
         set -euo pipefail
         BOX="${{ steps.create.outputs.box-id }}"
         SSH_KEY="${{ steps.sshkey.outputs.priv }}"
-        # TODO: pick a stable workdir convention for CI runs (e.g. /workspace).
-        # Confirm the box's default user has write access there, or chown on
-        # first push.
-        rsync -az --delete \
-          -e "ssh -i $SSH_KEY -o StrictHostKeyChecking=accept-new -o BatchMode=yes" \
-          ./ "$BOX:/workspace/"
+        SSH_OPTS=(-i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o BatchMode=yes)
+        # Stream the working tree into the box as a tar over ssh, instead
+        # of rsync. Minimal self-hosted runners frequently lack rsync
+        # (the box-CI failure that motivated this — exit 127, "rsync:
+        # command not found"); tar is in every base image and on the
+        # runner, and ssh is already exercised by the CI-context + setup
+        # steps below. Excludes .git — CI tests the checked-out tree, not
+        # history. /workspace is fresh per box, so rsync's --delete
+        # mirroring has nothing to prune.
+        ssh "${SSH_OPTS[@]}" "$BOX" -- "mkdir -p /workspace"
+        tar -cf - --exclude=./.git . | ssh "${SSH_OPTS[@]}" "$BOX" -- "tar -xf - -C /workspace"
 
     # ------------------------------------------------------------------
     # 5. Write CI context file into the box.
