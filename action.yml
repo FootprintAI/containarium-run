@@ -54,6 +54,17 @@ inputs:
     description: 'Cloud org id (UUID). Optional; when set, debug-box info is reported back to the cloud dashboard on failure. Find it under /settings or by inspecting an existing /v1/orgs/{org}/... URL while signed in.'
     required: false
     default: ''
+  ssh-host:
+    # The box's SSH host is normally taken from the create response's
+    # `sshHost` field — the cloud is the only party that knows it (the
+    # region CODE "asia-east" isn't the DNS LABEL "asia-east1", so it
+    # can't be derived client-side). This input is a FALLBACK for the
+    # window before the control plane is configured with per-region
+    # ssh_host: when the response carries no sshHost, the action uses
+    # this value instead. Leave empty once the cloud returns sshHost.
+    description: 'Override/fallback SSH host for the box (e.g. asia-east1.containarium.dev). Normally unset — the create response supplies it. Set only if your cloud has not yet been configured to return sshHost.'
+    required: false
+    default: ''
   preview-domain:
     # The PR-preview hostname the action passes to `containarium
     # expose-port --domain`. Required by the CLI; caller-supplied
@@ -196,6 +207,7 @@ runs:
         CONTAINARIUM_HTTP:   'true'
         CONTAINARIUM_SERVER: ${{ inputs.server }}
         CONTAINARIUM_TOKEN:  ${{ inputs.token }}
+        SSH_HOST_OVERRIDE:   ${{ inputs.ssh-host }}
       run: |
         set -euo pipefail
         # Box name must satisfy the daemon's jump-server username validator:
@@ -311,7 +323,104 @@ runs:
           echo "::error::box '${BOX_NAME}' could not be created after $attempts attempts"
           exit 1
         fi
-        echo "box-id=$BOX_NAME" >> "$GITHUB_OUTPUT"
+
+        # ---- Resolve the box's SSH identity from the create response ----
+        #
+        # The request `username` we sent ('${BOX_NAME}') is only the box's
+        # human NAME. The cloud assigns its own OSS-side username
+        # (cld-<short-id>) and returns it as `.container.username`; that is
+        # BOTH the SSH user (sshpiper routes by it) and the key the cloud
+        # addresses the box by on GET/DELETE — NOT the name we sent. The
+        # SSH host is `.container.sshHost` (the regional sentinel; the
+        # client cannot derive it — the region code isn't the DNS label).
+        # Every later step dials ${SSH_USER}@${SSH_HOST}, so resolve both
+        # here and fail loudly if either is missing rather than SSHing to a
+        # bare box name (which is exactly the "Could not resolve hostname"
+        # break this replaces).
+        SSH_USER=$(jq -r '.container.username // empty' /tmp/cnt-create.out 2>/dev/null || true)
+        SSH_HOST=$(jq -r '.container.sshHost  // empty' /tmp/cnt-create.out 2>/dev/null || true)
+        if [ -z "$SSH_HOST" ]; then
+          # Cloud hasn't been configured to return sshHost yet — fall back
+          # to the action input if the caller provided one.
+          SSH_HOST="${SSH_HOST_OVERRIDE:-}"
+        fi
+        if [ -z "$SSH_USER" ]; then
+          echo "::error::create succeeded but the response carried no container.username — cannot resolve the SSH user (the cloud keys boxes by cld-<id>). Response was:"
+          cat /tmp/cnt-create.out 2>/dev/null || true
+          exit 1
+        fi
+        if [ -z "$SSH_HOST" ]; then
+          echo "::error::no SSH host for the box: the create response had no .container.sshHost and no ssh-host input was set. Configure per-region ssh_host on the cloud (OSS_PRIMARY_SENTINELS), or pass the ssh-host input as a stopgap."
+          exit 1
+        fi
+        echo "box created: name='${BOX_NAME}' ssh-user='${SSH_USER}' ssh-host='${SSH_HOST}'"
+        {
+          echo "box-id=$BOX_NAME"
+          echo "ssh-user=$SSH_USER"
+          echo "ssh-host=$SSH_HOST"
+        } >> "$GITHUB_OUTPUT"
+
+    # ------------------------------------------------------------------
+    # 3c. Wait for the box to be RUNNING and SSH-reachable.
+    #
+    # Create is ASYNC: the cloud parks the request and a regional daemon
+    # provisions the box (image pull dominates — tens of seconds on a cold
+    # host). The box's username + host are known the moment create returns,
+    # but ssh won't connect until it's RUNNING and sshd is up. Poll the
+    # cloud for state, then probe ssh, so push/test don't race a
+    # half-provisioned box (that race is why a freshly-created box's first
+    # ssh used to fail intermittently).
+    # ------------------------------------------------------------------
+    - name: Wait for box ready
+      shell: bash
+      env:
+        CONTAINARIUM_SERVER: ${{ inputs.server }}
+        CONTAINARIUM_TOKEN:  ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+        SSH_USER="${{ steps.create.outputs.ssh-user }}"
+        SSH_HOST="${{ steps.create.outputs.ssh-host }}"
+        SSH_KEY="${{ steps.sshkey.outputs.priv }}"
+
+        # 1) Wait until the cloud reports the box RUNNING. GET is keyed by
+        #    the cloud username (cld-<id>) — the same identity we ssh as,
+        #    NOT the request name.
+        state_deadline=$(( $(date +%s) + 300 ))
+        state=""
+        while [ "$(date +%s)" -lt "$state_deadline" ]; do
+          body=$(curl -s --http1.1 -m 10 \
+            -H "authorization: Bearer ${CONTAINARIUM_TOKEN}" \
+            "${CONTAINARIUM_SERVER%/}/v1/containers/${SSH_USER}" 2>/dev/null || true)
+          state=$(printf '%s' "$body" | jq -r '.container.state // empty' 2>/dev/null || true)
+          case "$state" in
+            CONTAINER_STATE_RUNNING) echo "box ${SSH_USER} is RUNNING"; break ;;
+            CONTAINER_STATE_FAILED)  echo "::error::box ${SSH_USER} entered FAILED state"; exit 1 ;;
+            *) echo "waiting for RUNNING (state=${state:-unknown})"; sleep 5 ;;
+          esac
+        done
+        if [ "$state" != "CONTAINER_STATE_RUNNING" ]; then
+          echo "::error::box ${SSH_USER} did not reach RUNNING within 300s (last state=${state:-unknown})"
+          exit 1
+        fi
+
+        # 2) Wait until sshd answers. A no-op ssh is the honest readiness
+        #    probe — RUNNING means the box exists; sshpiper + the box's sshd
+        #    may need a few more seconds.
+        ssh_deadline=$(( $(date +%s) + 120 ))
+        until ssh -i "$SSH_KEY" \
+                  -o StrictHostKeyChecking=accept-new \
+                  -o IdentitiesOnly=yes \
+                  -o BatchMode=yes \
+                  -o ConnectTimeout=10 \
+                  "${SSH_USER}@${SSH_HOST}" true 2>/dev/null; do
+          if [ "$(date +%s)" -ge "$ssh_deadline" ]; then
+            echo "::error::box ${SSH_USER}@${SSH_HOST} did not accept SSH within 120s"
+            exit 1
+          fi
+          echo "waiting for sshd at ${SSH_USER}@${SSH_HOST}..."
+          sleep 5
+        done
+        echo "ssh to ${SSH_USER}@${SSH_HOST} is up"
 
     # ------------------------------------------------------------------
     # 4. Push source code into the box.
@@ -321,24 +430,23 @@ runs:
     # persistent users + a long-lived ~/.ssh/id_ed25519 — not a CI
     # one-shot). StrictHostKeyChecking=accept-new pins the host's
     # key on first connect; subsequent steps in the same job reuse
-    # the same known_hosts entry.
+    # the same known_hosts entry. We ssh as ${SSH_USER}@${SSH_HOST} —
+    # the cloud-assigned username (sshpiper routes by it) at the
+    # regional sentinel — NOT the bare box name.
     # ------------------------------------------------------------------
     - name: Push source to box
       shell: bash
-      env:
-        CONTAINARIUM_HTTP:   'true'
-        CONTAINARIUM_SERVER: ${{ inputs.server }}
-        CONTAINARIUM_TOKEN:  ${{ inputs.token }}
       run: |
         set -euo pipefail
-        BOX="${{ steps.create.outputs.box-id }}"
+        SSH_USER="${{ steps.create.outputs.ssh-user }}"
+        SSH_HOST="${{ steps.create.outputs.ssh-host }}"
         SSH_KEY="${{ steps.sshkey.outputs.priv }}"
         # TODO: pick a stable workdir convention for CI runs (e.g. /workspace).
         # Confirm the box's default user has write access there, or chown on
         # first push.
         rsync -az --delete \
-          -e "ssh -i $SSH_KEY -o StrictHostKeyChecking=accept-new -o BatchMode=yes" \
-          ./ "$BOX:/workspace/"
+          -e "ssh -i $SSH_KEY -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o BatchMode=yes" \
+          ./ "${SSH_USER}@${SSH_HOST}:/workspace/"
 
     # ------------------------------------------------------------------
     # 5. Write CI context file into the box.
@@ -357,7 +465,8 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        BOX="${{ steps.create.outputs.box-id }}"
+        SSH_USER="${{ steps.create.outputs.ssh-user }}"
+        SSH_HOST="${{ steps.create.outputs.ssh-host }}"
         SSH_KEY="${{ steps.sshkey.outputs.priv }}"
 
         # Pull PR-specific fields out of the event payload when this is a
@@ -411,8 +520,8 @@ runs:
           }' \
           > /tmp/ci-context.json
 
-        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o BatchMode=yes "$BOX" -- "mkdir -p /workspace/.containarium"
-        scp -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new /tmp/ci-context.json "$BOX:/workspace/.containarium/ci-context.json"
+        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o BatchMode=yes "${SSH_USER}@${SSH_HOST}" -- "mkdir -p /workspace/.containarium"
+        scp -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes /tmp/ci-context.json "${SSH_USER}@${SSH_HOST}:/workspace/.containarium/ci-context.json"
 
     # ------------------------------------------------------------------
     # 6. Run setup commands inside the box (the "warm cache" half).
@@ -422,9 +531,10 @@ runs:
       if: steps.config.outputs.setup != ''
       run: |
         set -euo pipefail
-        BOX="${{ steps.create.outputs.box-id }}"
+        SSH_USER="${{ steps.create.outputs.ssh-user }}"
+        SSH_HOST="${{ steps.create.outputs.ssh-host }}"
         SSH_KEY="${{ steps.sshkey.outputs.priv }}"
-        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o BatchMode=yes "$BOX" -- \
+        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o BatchMode=yes "${SSH_USER}@${SSH_HOST}" -- \
           "cd /workspace && ${{ steps.config.outputs.setup }}"
 
     # ------------------------------------------------------------------
@@ -439,12 +549,13 @@ runs:
       id: test
       run: |
         set -euo pipefail
-        BOX="${{ steps.create.outputs.box-id }}"
+        SSH_USER="${{ steps.create.outputs.ssh-user }}"
+        SSH_HOST="${{ steps.create.outputs.ssh-host }}"
         SSH_KEY="${{ steps.sshkey.outputs.priv }}"
         # Pipe through tee but preserve the exit status of ssh via
         # PIPESTATUS so a test failure still fails this step.
         set -o pipefail
-        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o BatchMode=yes "$BOX" -- \
+        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o BatchMode=yes "${SSH_USER}@${SSH_HOST}" -- \
           "cd /workspace && ${{ steps.config.outputs.test }}" \
           2>&1 | tee /tmp/test-output.log
         exit "${PIPESTATUS[0]}"
@@ -465,10 +576,11 @@ runs:
         SERVE_PORT: ${{ steps.config.outputs.serve-port }}
       run: |
         set -euo pipefail
-        BOX="${{ steps.create.outputs.box-id }}"
+        SSH_USER="${{ steps.create.outputs.ssh-user }}"
+        SSH_HOST="${{ steps.create.outputs.ssh-host }}"
         SSH_KEY="${{ steps.sshkey.outputs.priv }}"
         # Start the serve command in the background inside the box.
-        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o BatchMode=yes "$BOX" -- \
+        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o BatchMode=yes "${SSH_USER}@${SSH_HOST}" -- \
           "cd /workspace && nohup ${{ steps.config.outputs.serve-cmd }} >/tmp/serve.log 2>&1 &"
 
         # Skip the actual expose if the caller didn't provide a
@@ -488,10 +600,12 @@ runs:
         # CLI flag surface (per internal/cmd/expose_port.go in
         # FootprintAI/Containarium):
         #   containarium expose-port <username> --container-port N --domain HOST
-        # No `--output url` flag exists; the URL the caller composes
+        # The <username> is the cloud-assigned OSS username (cld-<id>) —
+        # the same identity the cloud keys the box by — NOT the request
+        # name. No `--output url` flag exists; the URL the caller composes
         # from preview-domain is the URL (the CLI just wires the
         # proxy route to it).
-        containarium expose-port "$BOX" \
+        containarium expose-port "$SSH_USER" \
           --container-port "$SERVE_PORT" \
           --domain "$PREVIEW_DOMAIN"
 
@@ -513,14 +627,17 @@ runs:
         # create (FootprintAI/Containarium#422: the CLI's HTTP/2 client
         # flaps through the edge). Teardown failures must not fail an
         # otherwise-green build, so a non-2xx is a warning, not an error;
-        # 404 means it's already gone.
-        BOX="${{ steps.create.outputs.box-id }}"
+        # 404 means it's already gone. DELETE is keyed by the cloud
+        # username (cld-<id>), the identity the cloud addresses the box by
+        # — NOT the request name (which the cloud only stored as the box's
+        # human handle).
+        SSH_USER="${{ steps.create.outputs.ssh-user }}"
         code=$(curl -sS --http1.1 -m 60 -o /dev/null -w '%{http_code}' \
-          -X DELETE "${CONTAINARIUM_SERVER%/}/v1/containers/${BOX}" \
+          -X DELETE "${CONTAINARIUM_SERVER%/}/v1/containers/${SSH_USER}" \
           -H "authorization: Bearer ${CONTAINARIUM_TOKEN}" 2>/dev/null || echo 000)
         case "$code" in
-          200|202|204|404) echo "box '${BOX}' torn down (HTTP ${code})" ;;
-          *) echo "::warning::teardown DELETE returned HTTP ${code} for '${BOX}' — box may be leaked" ;;
+          200|202|204|404) echo "box '${SSH_USER}' torn down (HTTP ${code})" ;;
+          *) echo "::warning::teardown DELETE returned HTTP ${code} for '${SSH_USER}' — box may be leaked" ;;
         esac
 
     # ------------------------------------------------------------------
@@ -538,7 +655,8 @@ runs:
         CONTAINARIUM_TOKEN:  ${{ inputs.token }}
       run: |
         set -euo pipefail
-        BOX="${{ steps.create.outputs.box-id }}"
+        SSH_USER="${{ steps.create.outputs.ssh-user }}"
+        SSH_HOST="${{ steps.create.outputs.ssh-host }}"
         SSH_KEY="${{ steps.sshkey.outputs.priv }}"
 
         # Refresh /workspace/.containarium/ci-context.json with what we
@@ -558,7 +676,7 @@ runs:
             || true)
           FAILURE_LOG_TAIL=$(tail -n 50 /tmp/test-output.log)
 
-          ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o BatchMode=yes "$BOX" -- \
+          ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o BatchMode=yes "${SSH_USER}@${SSH_HOST}" -- \
             "cat /workspace/.containarium/ci-context.json" > /tmp/ci-context.json.old || \
             echo '{}' > /tmp/ci-context.json.old
 
@@ -571,16 +689,22 @@ runs:
             }' \
             /tmp/ci-context.json.old > /tmp/ci-context.json
 
-          scp -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new /tmp/ci-context.json "$BOX:/workspace/.containarium/ci-context.json" || true
+          scp -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes /tmp/ci-context.json "${SSH_USER}@${SSH_HOST}:/workspace/.containarium/ci-context.json" || true
         fi
 
         # TODO: schedule auto-delete in 1h. Either via `containarium ttl set`
         # (new CLI verb needed) or via the Cloud API. Without this the box
         # leaks until manually deleted.
-        # TODO: extract host suffix from --api-url instead of hardcoding the
-        # cloud domain.
-        SSH_CMD="ssh -p 2222 debug@${BOX}.boxes.containarium.dev"
-        MCP_URL="ssh user@${BOX}.containarium.dev agent-box"
+        #
+        # Connection info is the REAL identity resolved at create: the
+        # cloud-assigned user (cld-<id>) at the regional sentinel, port 22
+        # (sshpiper routes by username) — not a hardcoded debug@…:2222.
+        # NOTE: SSH in needs a key the box trusts. CI minted a throwaway
+        # keypair that GHA discards at job end, so a human debugger must be
+        # a registered collaborator with their own key on the box (box-
+        # collaborators-governance) — key distribution is a separate change.
+        SSH_CMD="ssh ${SSH_USER}@${SSH_HOST}"
+        MCP_URL="ssh ${SSH_USER}@${SSH_HOST} agent-box"
         echo "url=$MCP_URL" >> "$GITHUB_OUTPUT"
         # TODO: sticky-comment behavior — find existing containarium-bot
         # comment on this PR and edit it instead of posting a new one.
@@ -627,10 +751,10 @@ runs:
         # fields so it can render its own panel without parsing
         # markdown back out. Both flow from the same source so they
         # stay in sync.
-        echo "ssh-host=${BOX}.boxes.containarium.dev" >> "$GITHUB_OUTPUT"
-        echo "ssh-port=2222"                          >> "$GITHUB_OUTPUT"
-        echo "ssh-user=debug"                         >> "$GITHUB_OUTPUT"
-        echo "mcp-url=$MCP_URL"                       >> "$GITHUB_OUTPUT"
+        echo "ssh-host=${SSH_HOST}"  >> "$GITHUB_OUTPUT"
+        echo "ssh-port=22"           >> "$GITHUB_OUTPUT"
+        echo "ssh-user=${SSH_USER}"  >> "$GITHUB_OUTPUT"
+        echo "mcp-url=$MCP_URL"      >> "$GITHUB_OUTPUT"
 
     # ------------------------------------------------------------------
     # 11. FAILURE PATH (continued) — report the kept-alive box back to
