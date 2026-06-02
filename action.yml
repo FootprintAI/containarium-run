@@ -198,56 +198,71 @@ runs:
         CONTAINARIUM_TOKEN:  ${{ inputs.token }}
       run: |
         set -euo pipefail
-        # Box name must satisfy the daemon's jump-server username
-        # validator: [a-zA-Z0-9_-], 1-32 chars, can't start with a
-        # digit or dash. Concatenating GITHUB_REPOSITORY##*/ (e.g.
-        # "Containarium-cloud") + GITHUB_RUN_ID (19 digits) +
-        # GITHUB_RUN_ATTEMPT easily blows past 32 chars and create
-        # rejects the box. GITHUB_RUN_ID is globally unique already;
-        # the repo prefix was just for human readability.
-        BOX_NAME="ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-        # TODO: containarium create currently targets the local daemon.
-        # The CLI needs `--api-url` + `--token` flags (or env-var honoring)
-        # to talk to remote Cloud / self-hosted endpoints. Track at
-        # FootprintAI/containarium#TODO.
-        # Retry create on TRANSIENT failures. The hosted edge
-        # (cloud.containarium.dev) can briefly return "tls: internal error"
-        # during a core-caddy config reload window
-        # (FootprintAI/Containarium#400); a create POST landing in that
-        # window fails even though the daemon is healthy. Retry those with
-        # exponential backoff. Permanent errors (already-exists, invalid
-        # argument, auth, quota) fail fast — retrying them just wastes
-        # minutes. Idempotent: "tls: internal error" fails the TLS
-        # handshake before the request reaches the daemon, so no box is
-        # created on a failed attempt; "already exists" is treated as
-        # success (the box we wanted is there).
+        # Box name must satisfy the daemon's jump-server username validator:
+        # [a-zA-Z0-9_-], 1-32 chars, no leading digit/dash. Make it JOB-unique
+        # (it was run-level — ci-<run>-<attempt> — so every job in a run shared
+        # ONE name and collided, especially when a failed job didn't tear down).
+        # 'b' prefix (no leading digit) + 12-char hash of (run, attempt, job) =
+        # 13 chars, unique per job.
+        SUFFIX=$(printf '%s-%s-%s' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_JOB" | sha1sum | cut -c1-12)
+        BOX_NAME="b${SUFFIX}"
+
+        # box_exists: does the daemon already have this box? 200=yes, 404=no.
+        # Retries through the brief edge-TLS flap (FootprintAI/Containarium#400)
+        # so a transient GET failure isn't misread as "absent".
+        box_exists() {
+          local code
+          for _ in 1 2 3; do
+            code=$(curl -s -m10 -o /dev/null -w '%{http_code}' \
+              -H "authorization: Bearer ${CONTAINARIUM_TOKEN}" \
+              "${CONTAINARIUM_SERVER%/}/v1/containers/${BOX_NAME}" 2>/dev/null || true)
+            case "$code" in
+              200) return 0 ;;
+              404) return 1 ;;
+              *)   sleep 2 ;;
+            esac
+          done
+          return 1
+        }
+
+        # Idempotent create. #400: the hosted edge can drop the RESPONSE of a
+        # create the daemon actually completed ("tls: internal error" with the
+        # box already provisioned). So on ANY create failure, check whether the
+        # box exists before retrying — if it's there, we're done. Only re-POST
+        # when the box is genuinely absent. Fail fast on clearly-permanent
+        # errors (invalid arg / quota / auth) instead of burning all attempts.
         attempts=5
         delay=2
+        created=0
         for i in $(seq 1 "$attempts"); do
           if out=$(containarium create "$BOX_NAME" \
                 --image "${{ steps.config.outputs.image }}" \
                 --ssh-key "${{ steps.sshkey.outputs.pub }}" 2>&1); then
             echo "$out"
+            created=1
             break
           fi
           echo "$out"
-          if echo "$out" | grep -qiE 'already exists|alreadyexists'; then
-            echo "box already exists — treating as created"
+          if box_exists; then
+            echo "create response failed but box '${BOX_NAME}' exists — treating as created (FootprintAI/Containarium#400)"
+            created=1
             break
           fi
-          if echo "$out" | grep -qiE 'tls: internal error|connection reset|connection refused|i/o timeout|timeout|temporarily unavailable|unexpected eof|\beof\b|http2|50[234]'; then
-            if [ "$i" -lt "$attempts" ]; then
-              echo "::warning::transient create failure (attempt $i/$attempts) — retrying in ${delay}s"
-              sleep "$delay"
-              delay=$(( delay * 2 ))
-              continue
-            fi
-            echo "::error::create still failing after $attempts attempts (transient — see FootprintAI/Containarium#400)"
+          if echo "$out" | grep -qiE 'invalid|quota|forbidden|unauthor|permission|not allowed|bad request'; then
+            echo "::error::create failed (permanent) — not retrying"
             exit 1
           fi
-          echo "::error::create failed (non-transient) — not retrying"
-          exit 1
+          if [ "$i" -lt "$attempts" ]; then
+            echo "::warning::create attempt $i/$attempts failed and box not present — retrying in ${delay}s"
+            sleep "$delay"
+            delay=$(( delay * 2 ))
+            continue
+          fi
         done
+        if [ "$created" -ne 1 ]; then
+          echo "::error::box '${BOX_NAME}' could not be created after $attempts attempts (see FootprintAI/Containarium#400)"
+          exit 1
+        fi
         echo "box-id=$BOX_NAME" >> "$GITHUB_OUTPUT"
 
     # ------------------------------------------------------------------
