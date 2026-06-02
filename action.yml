@@ -247,18 +247,42 @@ runs:
         # flap entirely. We still guard idempotency: on any non-2xx, check
         # whether the box exists before retrying (the daemon may have created
         # it and only the response dropped), and fail fast on a permanent 4xx.
+        # Preflight: a missing server is the single most common
+        # misconfiguration and otherwise surfaces as an opaque HTTP 000.
+        # (The value is masked in logs if it's a secret; we only assert
+        # it's non-empty.) Fail fast with an actionable message.
+        if [ -z "${CONTAINARIUM_SERVER:-}" ]; then
+          echo "::error::CONTAINARIUM_SERVER is empty — set the repo/org secret to your edge, e.g. https://cloud.containarium.dev"
+          exit 1
+        fi
+
         attempts=5
         delay=2
         created=0
         for i in $(seq 1 "$attempts"); do
+          # Capture curl's transport exit code separately from the HTTP
+          # status so a connection-level failure (HTTP 000) is debuggable
+          # instead of opaque: curl exit 6=DNS/unknown host, 7=connection
+          # refused, 28=timeout, 35=TLS handshake. `set +e` so a non-zero
+          # curl doesn't trip `set -e` before we read $?.
+          set +e
           http_code=$(curl -sS --http1.1 -m 900 -o /tmp/cnt-create.out -w '%{http_code}' \
             -X POST "${CONTAINARIUM_SERVER%/}/v1/containers" \
             -H "authorization: Bearer ${CONTAINARIUM_TOKEN}" \
             -H 'content-type: application/json' \
-            -d "$body" 2>/dev/null || echo 000)
+            -d "$body" 2>/tmp/cnt-create.err)
+          curl_rc=$?
+          set -e
           out=$(cat /tmp/cnt-create.out 2>/dev/null || true)
-          echo "create '${BOX_NAME}' -> HTTP ${http_code}"
+          echo "create '${BOX_NAME}' -> HTTP ${http_code} (curl exit ${curl_rc})"
           [ -n "$out" ] && echo "$out"
+          if [ "$curl_rc" -ne 0 ]; then
+            # No HTTP response (HTTP 000). The server URL is a masked secret
+            # in logs, but curl's exit code + message (e.g. "Could not
+            # resolve host", "Connection refused") localizes the cause —
+            # almost always a wrong/empty CONTAINARIUM_SERVER, DNS, or TLS.
+            echo "::warning::curl transport error (exit ${curl_rc}): $(tr -d '\r' < /tmp/cnt-create.err | tail -1)"
+          fi
           case "$http_code" in
             200|201)
               created=1
