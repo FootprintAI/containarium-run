@@ -210,9 +210,44 @@ runs:
         # The CLI needs `--api-url` + `--token` flags (or env-var honoring)
         # to talk to remote Cloud / self-hosted endpoints. Track at
         # FootprintAI/containarium#TODO.
-        containarium create "$BOX_NAME" \
-          --image "${{ steps.config.outputs.image }}" \
-          --ssh-key "${{ steps.sshkey.outputs.pub }}"
+        # Retry create on TRANSIENT failures. The hosted edge
+        # (cloud.containarium.dev) can briefly return "tls: internal error"
+        # during a core-caddy config reload window
+        # (FootprintAI/Containarium#400); a create POST landing in that
+        # window fails even though the daemon is healthy. Retry those with
+        # exponential backoff. Permanent errors (already-exists, invalid
+        # argument, auth, quota) fail fast — retrying them just wastes
+        # minutes. Idempotent: "tls: internal error" fails the TLS
+        # handshake before the request reaches the daemon, so no box is
+        # created on a failed attempt; "already exists" is treated as
+        # success (the box we wanted is there).
+        attempts=5
+        delay=2
+        for i in $(seq 1 "$attempts"); do
+          if out=$(containarium create "$BOX_NAME" \
+                --image "${{ steps.config.outputs.image }}" \
+                --ssh-key "${{ steps.sshkey.outputs.pub }}" 2>&1); then
+            echo "$out"
+            break
+          fi
+          echo "$out"
+          if echo "$out" | grep -qiE 'already exists|alreadyexists'; then
+            echo "box already exists — treating as created"
+            break
+          fi
+          if echo "$out" | grep -qiE 'tls: internal error|connection reset|connection refused|i/o timeout|timeout|temporarily unavailable|unexpected eof|\beof\b|http2|50[234]'; then
+            if [ "$i" -lt "$attempts" ]; then
+              echo "::warning::transient create failure (attempt $i/$attempts) — retrying in ${delay}s"
+              sleep "$delay"
+              delay=$(( delay * 2 ))
+              continue
+            fi
+            echo "::error::create still failing after $attempts attempts (transient — see FootprintAI/Containarium#400)"
+            exit 1
+          fi
+          echo "::error::create failed (non-transient) — not retrying"
+          exit 1
+        done
         echo "box-id=$BOX_NAME" >> "$GITHUB_OUTPUT"
 
     # ------------------------------------------------------------------
