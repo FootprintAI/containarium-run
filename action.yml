@@ -213,7 +213,7 @@ runs:
         box_exists() {
           local code
           for _ in 1 2 3; do
-            code=$(curl -s -m10 -o /dev/null -w '%{http_code}' \
+            code=$(curl -s --http1.1 -m10 -o /dev/null -w '%{http_code}' \
               -H "authorization: Bearer ${CONTAINARIUM_TOKEN}" \
               "${CONTAINARIUM_SERVER%/}/v1/containers/${BOX_NAME}" 2>/dev/null || true)
             case "$code" in
@@ -225,42 +225,66 @@ runs:
           return 1
         }
 
-        # Idempotent create. #400: the hosted edge can drop the RESPONSE of a
-        # create the daemon actually completed ("tls: internal error" with the
-        # box already provisioned). So on ANY create failure, check whether the
-        # box exists before retrying — if it's there, we're done. Only re-POST
-        # when the box is genuinely absent. Fail fast on clearly-permanent
-        # errors (invalid arg / quota / auth) instead of burning all attempts.
+        # Build the create request body. Matches the daemon's REST schema
+        # (camelCase) and the CLI's historical flag defaults (cpu 4 /
+        # memory 4GB / disk 50GB) so behaviour is unchanged from the old
+        # `containarium create` invocation.
+        body=$(jq -nc \
+          --arg u   "$BOX_NAME" \
+          --arg img "${{ steps.config.outputs.image }}" \
+          --arg key "${{ steps.sshkey.outputs.pub }}" \
+          '{username:$u, image:$img, sshKeys:[$key],
+            resources:{cpu:"4", memory:"4GB", disk:"50GB"}}')
+
+        # Idempotent create via the REST API over curl (HTTP/1.1).
+        #
+        # Why curl and not `containarium create`: the Go CLI's REST client
+        # auto-negotiates HTTP/2, and a long-running create carried on an
+        # HTTP/2 connection through the fronting TLS edge intermittently
+        # resets the response with `tls: internal error` even though the box
+        # was provisioned (FootprintAI/Containarium#422 — confirmed h2-only;
+        # HTTP/1.1 is clean). curl defaults to HTTP/1.1, so it sidesteps the
+        # flap entirely. We still guard idempotency: on any non-2xx, check
+        # whether the box exists before retrying (the daemon may have created
+        # it and only the response dropped), and fail fast on a permanent 4xx.
         attempts=5
         delay=2
         created=0
         for i in $(seq 1 "$attempts"); do
-          if out=$(containarium create "$BOX_NAME" \
-                --image "${{ steps.config.outputs.image }}" \
-                --ssh-key "${{ steps.sshkey.outputs.pub }}" 2>&1); then
-            echo "$out"
-            created=1
-            break
-          fi
-          echo "$out"
+          http_code=$(curl -sS --http1.1 -m 900 -o /tmp/cnt-create.out -w '%{http_code}' \
+            -X POST "${CONTAINARIUM_SERVER%/}/v1/containers" \
+            -H "authorization: Bearer ${CONTAINARIUM_TOKEN}" \
+            -H 'content-type: application/json' \
+            -d "$body" 2>/dev/null || echo 000)
+          out=$(cat /tmp/cnt-create.out 2>/dev/null || true)
+          echo "create '${BOX_NAME}' -> HTTP ${http_code}"
+          [ -n "$out" ] && echo "$out"
+          case "$http_code" in
+            200|201)
+              created=1
+              break
+              ;;
+            400|401|403|404|422)
+              echo "::error::create failed (HTTP ${http_code}, permanent) — not retrying"
+              exit 1
+              ;;
+          esac
+          # 5xx / 000 (timeout or dropped response) / 409: the daemon may
+          # have created the box anyway — check before retrying.
           if box_exists; then
-            echo "create response failed but box '${BOX_NAME}' exists — treating as created (FootprintAI/Containarium#400)"
+            echo "create response was HTTP ${http_code} but box '${BOX_NAME}' exists — treating as created"
             created=1
             break
-          fi
-          if echo "$out" | grep -qiE 'invalid|quota|forbidden|unauthor|permission|not allowed|bad request'; then
-            echo "::error::create failed (permanent) — not retrying"
-            exit 1
           fi
           if [ "$i" -lt "$attempts" ]; then
-            echo "::warning::create attempt $i/$attempts failed and box not present — retrying in ${delay}s"
+            echo "::warning::create attempt $i/$attempts failed (HTTP ${http_code}) and box absent — retrying in ${delay}s"
             sleep "$delay"
             delay=$(( delay * 2 ))
             continue
           fi
         done
         if [ "$created" -ne 1 ]; then
-          echo "::error::box '${BOX_NAME}' could not be created after $attempts attempts (see FootprintAI/Containarium#400)"
+          echo "::error::box '${BOX_NAME}' could not be created after $attempts attempts"
           exit 1
         fi
         echo "box-id=$BOX_NAME" >> "$GITHUB_OUTPUT"
@@ -461,7 +485,19 @@ runs:
         CONTAINARIUM_TOKEN:  ${{ inputs.token }}
       run: |
         set -euo pipefail
-        containarium delete "${{ steps.create.outputs.box-id }}" --yes
+        # Delete via the REST API over curl (HTTP/1.1) — same reason as
+        # create (FootprintAI/Containarium#422: the CLI's HTTP/2 client
+        # flaps through the edge). Teardown failures must not fail an
+        # otherwise-green build, so a non-2xx is a warning, not an error;
+        # 404 means it's already gone.
+        BOX="${{ steps.create.outputs.box-id }}"
+        code=$(curl -sS --http1.1 -m 60 -o /dev/null -w '%{http_code}' \
+          -X DELETE "${CONTAINARIUM_SERVER%/}/v1/containers/${BOX}" \
+          -H "authorization: Bearer ${CONTAINARIUM_TOKEN}" 2>/dev/null || echo 000)
+        case "$code" in
+          200|202|204|404) echo "box '${BOX}' torn down (HTTP ${code})" ;;
+          *) echo "::warning::teardown DELETE returned HTTP ${code} for '${BOX}' — box may be leaked" ;;
+        esac
 
     # ------------------------------------------------------------------
     # 10. FAILURE PATH — keep box alive, refresh CI context with
