@@ -714,10 +714,31 @@ runs:
           scp -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes /tmp/ci-context.json "${SSH_USER}@${SSH_HOST}:~/work/.containarium/ci-context.json" || true
         fi
 
-        # TODO: schedule auto-delete in 1h. Either via `containarium ttl set`
-        # (new CLI verb needed) or via the Cloud API. Without this the box
-        # leaks until manually deleted.
+        # Schedule auto-delete in 1h so the kept-alive debug box self-reaps
+        # instead of leaking until someone deletes it by hand. The cloud
+        # serves the OSS contract's SetContainerTTL RPC at
+        # POST /v1/containers/<name>/ttl (FootprintAI/Containarium, server
+        # handler in internal/server/container_server_ttl.go) — body is
+        # {"durationSeconds": N}, the box is keyed by the cloud username
+        # (cld-<id>), and the daemon's ttlsweeper force-deletes once the
+        # wall clock passes now()+N. 3600s matches the "expires in 60
+        # minutes" the debug comment below promises.
         #
+        # Best-effort, same as teardown: a failed TTL stamp must not turn an
+        # already-red build into a different red. A server that predates the
+        # handler returns 501 (Unimplemented) — we warn and the box falls
+        # back to manual cleanup rather than failing the step. curl over
+        # HTTP/1.1 for the same #422 reason as create/delete.
+        code=$(curl -sS --http1.1 -m 60 -o /dev/null -w '%{http_code}' \
+          -X POST "${CONTAINARIUM_SERVER%/}/v1/containers/${SSH_USER}/ttl" \
+          -H "authorization: Bearer ${CONTAINARIUM_TOKEN}" \
+          -H 'content-type: application/json' \
+          -d '{"durationSeconds": 3600}' 2>/dev/null || echo 000)
+        case "$code" in
+          200|201|204) echo "box '${SSH_USER}' will auto-delete in 1h (TTL set, HTTP ${code})" ;;
+          *) echo "::warning::could not set 1h auto-delete TTL on '${SSH_USER}' (HTTP ${code}) — box may leak until manually deleted" ;;
+        esac
+
         # Connection info is the REAL identity resolved at create: the
         # cloud-assigned user (cld-<id>) at the regional sentinel, port 22
         # (sshpiper routes by username) — not a hardcoded debug@…:2222.
