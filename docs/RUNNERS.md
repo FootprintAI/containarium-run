@@ -64,13 +64,28 @@ Two levers raise the real ceiling:
 - **Add backends to the pool.** More hosts tagged into `cloud-tenants` →
   boxes spread across them. The driver registry places per region; the
   driver-queue drains bursts.
-- **Right-size CI boxes.** CI rarely needs 4 cores. In your
-  `.github/containarium.*.yml`, a smaller box (≈1–2cpu / 2GB) fits 2–4× more
-  concurrent boxes per host. *(Box sizing is set on create; surface it as a
-  `containarium-run` input or a config field if not already.)*
+- **Right-size CI boxes.** CI rarely needs 4 cores. A smaller box fits more
+  concurrent boxes per host, since packing is roughly
+  `floor(host vCPU / box vCPU)` — e.g. on a 16-vCPU host, 2-vCPU boxes pack 8
+  vs four 4-vCPU boxes. Set the size two ways (first non-empty wins):
+  - **`resources:` in `containarium.yml`** — per-repo:
+    ```yaml
+    resources:
+      cpu: "2"
+      memory: "2GB"
+      disk: "30GB"
+    ```
+  - **`box-cpu` / `box-memory` / `box-disk` action inputs** — per-workflow;
+    default `4` / `4GB` / `50GB` when neither is set.
+
+  Size to the build's real CPU/RAM peak plus headroom — undersizing trades
+  queue time for slower builds, and under-provisioned **memory OOM-kills**
+  the build rather than just slowing it. The chosen size is echoed in the run
+  logs (`box size: cpu=… memory=… disk=…`).
 
 **Rule of thumb:** set `COUNT` ≈ `floor(total pool vCPU / box vCPU)`, leaving
-headroom for the daemon itself.
+headroom for the daemon itself. Lower `box vCPU` raises *both* the per-host
+packing density and the runner `COUNT` you can usefully run.
 
 ## Persistent vs ephemeral runners
 
