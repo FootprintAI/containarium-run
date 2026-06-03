@@ -65,6 +65,9 @@ test:
 | `server` | No | `https://cloud.containarium.dev` | Containarium server address (matches CLI's `--server` flag / `CONTAINARIUM_SERVER` env var). Point at your self-hosted instance if not using Cloud. |
 | `token` | **Yes** | — | API token. Use a GitHub Actions secret. |
 | `config` | No | `.github/containarium.yml` | Path to the containarium config file in your repo. |
+| `box-cpu` | No | `4` | CPU cores for the box. Smaller boxes pack more parallel jobs per backend host (see [docs/RUNNERS.md](docs/RUNNERS.md)). A `resources.cpu` in `containarium.yml` overrides this per-role. |
+| `box-memory` | No | `4GB` | Memory for the box. Overridden by `resources.memory` in `containarium.yml`. |
+| `box-disk` | No | `50GB` | Disk for the box. Overridden by `resources.disk` in `containarium.yml`. |
 | `cache-key` | No | — | *(planned; not in v1)* Cache key to reuse a warm box across runs (e.g. `${{ hashFiles('go.sum') }}`). |
 | `keep-on-failure` | No | `true` | On test failure, keep box alive 1h and post a debug comment on the PR. |
 | `org-id` | No | — | Cloud org UUID. When set, debug-box endpoint info (SSH host/port/user, MCP URL, keep-alive deadline) is reported back to the cloud's CI dashboard on test failure so the `/ci/runs/<id>` panel renders real connection info. Skipped silently when empty — preserves backwards-compat for users who haven't run the onboarding wizard. |
