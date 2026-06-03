@@ -451,19 +451,22 @@ runs:
         SSH_USER="${{ steps.create.outputs.ssh-user }}"
         SSH_HOST="${{ steps.create.outputs.ssh-host }}"
         SSH_KEY="${{ steps.sshkey.outputs.priv }}"
-        SSHOPTS="-i $SSH_KEY -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o BatchMode=yes"
-        # Push the working tree via tar-over-ssh rather than rsync: base box
-        # images ship tar but NOT rsync (the rsync push failed with
-        # "rsync: command not found" → exit 12). Login is root, so /workspace
-        # is writable. A fresh box starts empty, so a plain extract is
-        # equivalent to rsync --delete here.
-        ssh $SSHOPTS "${SSH_USER}@${SSH_HOST}" "mkdir -p /workspace"
-        tar -czf - . | ssh $SSHOPTS "${SSH_USER}@${SSH_HOST}" "tar -xzf - -C /workspace"
+        # Use the platform's own source-sync primitive — `containarium sync`,
+        # the CLI behind the MCP `sync`/`push` tools — instead of hand-rolling
+        # the transfer. It mirrors the working tree via tar-over-ssh (box
+        # images lack rsync) into the box's default ~/work over the SAME
+        # sentinel → sshpiper → box path, as a NON-root user (so it sidesteps
+        # the "/workspace: Permission denied" we'd hit writing at the root).
+        # `sync` (not `push`) because CI's checkout is a shallow, detached
+        # merge ref — sync mirrors the tree with no git/branch ceremony.
+        containarium sync "$SSH_USER" . \
+          --sentinel "$SSH_HOST" \
+          --key "$SSH_KEY"
 
     # ------------------------------------------------------------------
     # 5. Write CI context file into the box.
     #
-    # Drops /workspace/.containarium/ci-context.json so the agent-box
+    # Drops ~/work/.containarium/ci-context.json so the agent-box
     # MCP server can expose it as a resource. Without this, an agent
     # connecting to a failing box has zero context and wastes its first
     # turn asking "what am I looking at?" — see the companion change to
@@ -528,12 +531,12 @@ runs:
             run_id: $run_id,
             run_url: $run_url,
             run_attempt: $run_attempt,
-            workspace_path: "/workspace"
+            workspace_path: "~/work"
           }' \
           > /tmp/ci-context.json
 
-        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o BatchMode=yes "${SSH_USER}@${SSH_HOST}" -- "mkdir -p /workspace/.containarium"
-        scp -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes /tmp/ci-context.json "${SSH_USER}@${SSH_HOST}:/workspace/.containarium/ci-context.json"
+        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o BatchMode=yes "${SSH_USER}@${SSH_HOST}" -- "mkdir -p ~/work/.containarium"
+        scp -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes /tmp/ci-context.json "${SSH_USER}@${SSH_HOST}:~/work/.containarium/ci-context.json"
 
     # ------------------------------------------------------------------
     # 6. Run setup commands inside the box (the "warm cache" half).
@@ -547,7 +550,7 @@ runs:
         SSH_HOST="${{ steps.create.outputs.ssh-host }}"
         SSH_KEY="${{ steps.sshkey.outputs.priv }}"
         ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o BatchMode=yes "${SSH_USER}@${SSH_HOST}" -- \
-          "cd /workspace && ${{ steps.config.outputs.setup }}"
+          "cd ~/work && ${{ steps.config.outputs.setup }}"
 
     # ------------------------------------------------------------------
     # 7. Run the actual tests.
@@ -568,7 +571,7 @@ runs:
         # PIPESTATUS so a test failure still fails this step.
         set -o pipefail
         ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o BatchMode=yes "${SSH_USER}@${SSH_HOST}" -- \
-          "cd /workspace && ${{ steps.config.outputs.test }}" \
+          "cd ~/work && ${{ steps.config.outputs.test }}" \
           2>&1 | tee /tmp/test-output.log
         exit "${PIPESTATUS[0]}"
 
@@ -593,7 +596,7 @@ runs:
         SSH_KEY="${{ steps.sshkey.outputs.priv }}"
         # Start the serve command in the background inside the box.
         ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o BatchMode=yes "${SSH_USER}@${SSH_HOST}" -- \
-          "cd /workspace && nohup ${{ steps.config.outputs.serve-cmd }} >/tmp/serve.log 2>&1 &"
+          "cd ~/work && nohup ${{ steps.config.outputs.serve-cmd }} >/tmp/serve.log 2>&1 &"
 
         # Skip the actual expose if the caller didn't provide a
         # preview-domain — same posture as the org-id gate on the
@@ -671,7 +674,7 @@ runs:
         SSH_HOST="${{ steps.create.outputs.ssh-host }}"
         SSH_KEY="${{ steps.sshkey.outputs.priv }}"
 
-        # Refresh /workspace/.containarium/ci-context.json with what we
+        # Refresh ~/work/.containarium/ci-context.json with what we
         # learned from the test run — failing_test name + tail of output.
         # Best-effort: if there's no test-output.log (e.g. setup itself
         # failed) we skip the refresh and the create-time context is what
@@ -689,7 +692,7 @@ runs:
           FAILURE_LOG_TAIL=$(tail -n 50 /tmp/test-output.log)
 
           ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o BatchMode=yes "${SSH_USER}@${SSH_HOST}" -- \
-            "cat /workspace/.containarium/ci-context.json" > /tmp/ci-context.json.old || \
+            "cat ~/work/.containarium/ci-context.json" > /tmp/ci-context.json.old || \
             echo '{}' > /tmp/ci-context.json.old
 
           jq \
@@ -701,7 +704,7 @@ runs:
             }' \
             /tmp/ci-context.json.old > /tmp/ci-context.json
 
-          scp -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes /tmp/ci-context.json "${SSH_USER}@${SSH_HOST}:/workspace/.containarium/ci-context.json" || true
+          scp -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes /tmp/ci-context.json "${SSH_USER}@${SSH_HOST}:~/work/.containarium/ci-context.json" || true
         fi
 
         # TODO: schedule auto-delete in 1h. Either via `containarium ttl set`
