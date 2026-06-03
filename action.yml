@@ -452,29 +452,23 @@ runs:
         SSH_HOST="${{ steps.create.outputs.ssh-host }}"
         SSH_KEY="${{ steps.sshkey.outputs.priv }}"
         SSHOPTS="-i $SSH_KEY -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o BatchMode=yes"
-        # Use the platform's own source-sync primitive — `containarium sync`,
-        # the CLI behind the MCP `sync`/`push` tools — instead of hand-rolling
-        # the transfer. It mirrors the working tree via tar-over-ssh (box
-        # images lack rsync) over the SAME sentinel → sshpiper → box path.
-        # `sync` (not `push`) because CI's checkout is a shallow, detached
-        # merge ref — sync mirrors the tree with no git/branch ceremony.
+        T="${SSH_USER}@${SSH_HOST}"
+        # Confirm the REAL ssh session can write the workdir (diagnostic;
+        # cheap, and pinpoints any session/permission surprise).
+        ssh $SSHOPTS "$T" 'echo "DIAG home=$HOME pwd=$(pwd) user=$(whoami)"; mkdir -p ~/work && echo DIAG-mkdir-ok || echo DIAG-mkdir-FAIL; (touch ~/work/.probe && echo DIAG-write-ok) || echo DIAG-write-FAIL'
+        # Push the working tree via tar-over-ssh into ~/work.
         #
-        # --remote-path must be an ABSOLUTE <home>/work. Two traps:
-        #   1. sync's DEFAULT is /home/<username>/work — it assumes the box logs
-        #      us in as the cloud username (cld-<id>). It doesn't: login is the
-        #      box's own non-root user (home != /home/cld-<id>).
-        #   2. a RELATIVE path resolves against the ssh session's cwd, which
-        #      isn't guaranteed to be $HOME → `mkdir work` can fail.
-        # So resolve the LOGIN user's real $HOME over ssh and sync to an
-        # absolute <home>/work — the same dir `cd ~/work` (setup/test) hits.
-        BOX_HOME=$(ssh $SSHOPTS "${SSH_USER}@${SSH_HOST}" 'printf %s "$HOME"')
-        echo "box login home: ${BOX_HOME:-<empty>}"
-        [ -n "$BOX_HOME" ] || { echo "::error::could not resolve box \$HOME over ssh"; exit 1; }
-        containarium sync "$SSH_USER" . \
-          --remote-path "$BOX_HOME/work" \
-          --sentinel "$SSH_HOST" \
-          --key "$SSH_KEY" \
-          --verbose
+        # NOTE: we hand-roll this rather than `containarium sync` because
+        # sync's first step — read a remote manifest (find + sha256sum at the
+        # remote path) — fails in THIS box's ssh session with an opaque
+        # "read remote manifest: ssh manifest: exit status 1". The same script
+        # runs fine via `su - <cld-user>` on the box, so it's specific to the
+        # real sentinel → sshpiper → box session; there's no sync flag to skip
+        # the manifest read. Filed upstream. tar only needs mkdir + extract, so
+        # it sidesteps it. ~ expands to the cld-<id> login user's writable home,
+        # and combining mkdir + extract in one remote command makes it
+        # cwd-independent.
+        tar -czf - . | ssh $SSHOPTS "$T" "mkdir -p ~/work && tar -xzf - -C ~/work"
 
     # ------------------------------------------------------------------
     # 5. Write CI context file into the box.
