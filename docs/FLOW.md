@@ -80,20 +80,25 @@ We push the working tree with the platform's own source-sync primitive — the
 tools:
 
 ```bash
-containarium sync "$SSH_USER" . --remote-path work --sentinel "$SSH_HOST" --key "$SSH_KEY"
+BOX_HOME=$(ssh $SSHOPTS "$SSH_USER@$SSH_HOST" 'printf %s "$HOME"')
+containarium sync "$SSH_USER" . --remote-path "$BOX_HOME/work" --sentinel "$SSH_HOST" --key "$SSH_KEY"
 ```
 
 It mirrors the local tree into **`~/work`** over the same
 `sentinel → sshpiper → box` SSH path, then `setup`/`test` run with `cd ~/work`.
 
-> ⚠️ `--remote-path work` (relative) is deliberate. `sync`'s default resolves
-> to `/home/<username>/work` — it assumes the box logs you in as the cloud
-> username (`cld-<id>`). **It doesn't**: the box logs you in as its own
-> non-root default user, whose home is *not* `/home/cld-<id>`, so the default
-> `mkdir` fails with `read remote manifest: ... exit status 1`. A relative path
-> lands in the *login* user's `$HOME/work` — the same dir `cd ~/work` resolves
-> to. (Worth fixing upstream so cloud-created boxes log in as their `cld-<id>`
-> user; until then, pass the relative path.)
+> ⚠️ `--remote-path` must be an **absolute** `<home>/work`, resolved from the
+> box's real `$HOME`. Two traps otherwise:
+> 1. `sync`'s **default** is `/home/<username>/work` — it assumes the box logs
+>    you in as the cloud username (`cld-<id>`). **It doesn't**: login is the
+>    box's own non-root user, whose home is *not* `/home/cld-<id>`, so the
+>    default `mkdir` fails with `read remote manifest: ... exit status 1`.
+> 2. a **relative** path resolves against the ssh session's cwd, which isn't
+>    guaranteed to be `$HOME`.
+>
+> Resolving `$HOME` over ssh and passing `<home>/work` dodges both — it's the
+> same dir `cd ~/work` hits. (Worth fixing upstream so cloud boxes log in as
+> their `cld-<id>` user, then `sync`'s default would Just Work.)
 
 Why this and not a hand-rolled transfer (we tried both and hit walls):
 

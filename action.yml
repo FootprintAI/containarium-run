@@ -451,6 +451,7 @@ runs:
         SSH_USER="${{ steps.create.outputs.ssh-user }}"
         SSH_HOST="${{ steps.create.outputs.ssh-host }}"
         SSH_KEY="${{ steps.sshkey.outputs.priv }}"
+        SSHOPTS="-i $SSH_KEY -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o BatchMode=yes"
         # Use the platform's own source-sync primitive — `containarium sync`,
         # the CLI behind the MCP `sync`/`push` tools — instead of hand-rolling
         # the transfer. It mirrors the working tree via tar-over-ssh (box
@@ -458,17 +459,22 @@ runs:
         # `sync` (not `push`) because CI's checkout is a shallow, detached
         # merge ref — sync mirrors the tree with no git/branch ceremony.
         #
-        # --remote-path is a RELATIVE `work` on purpose. sync's default
-        # resolves to /home/<username>/work — i.e. it assumes the box logs us
-        # in as the cloud username (cld-<id>). It doesn't: the box logs us in
-        # as its own non-root default user, whose home is NOT /home/cld-<id>,
-        # so that default mkdir fails ("read remote manifest: exit status 1").
-        # A relative path lands in the LOGIN user's $HOME/work — the same dir
-        # `cd ~/work` (setup/test) resolves to.
+        # --remote-path must be an ABSOLUTE <home>/work. Two traps:
+        #   1. sync's DEFAULT is /home/<username>/work — it assumes the box logs
+        #      us in as the cloud username (cld-<id>). It doesn't: login is the
+        #      box's own non-root user (home != /home/cld-<id>).
+        #   2. a RELATIVE path resolves against the ssh session's cwd, which
+        #      isn't guaranteed to be $HOME → `mkdir work` can fail.
+        # So resolve the LOGIN user's real $HOME over ssh and sync to an
+        # absolute <home>/work — the same dir `cd ~/work` (setup/test) hits.
+        BOX_HOME=$(ssh $SSHOPTS "${SSH_USER}@${SSH_HOST}" 'printf %s "$HOME"')
+        echo "box login home: ${BOX_HOME:-<empty>}"
+        [ -n "$BOX_HOME" ] || { echo "::error::could not resolve box \$HOME over ssh"; exit 1; }
         containarium sync "$SSH_USER" . \
-          --remote-path work \
+          --remote-path "$BOX_HOME/work" \
           --sentinel "$SSH_HOST" \
-          --key "$SSH_KEY"
+          --key "$SSH_KEY" \
+          --verbose
 
     # ------------------------------------------------------------------
     # 5. Write CI context file into the box.
