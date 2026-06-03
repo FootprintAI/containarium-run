@@ -25,11 +25,11 @@ Every job runs these steps (see [`action.yml`](../action.yml)):
    `CREATING`/`PENDING` state.
 5. **Wait until ready** — poll the cloud for `RUNNING`, then probe SSH until
    it answers. Create is async, so this avoids racing a half-provisioned box.
-6. **Push the working tree** — tar-over-ssh into `/workspace` (see "Source
+6. **Push the working tree** — `containarium sync` into `~/work` (see "Source
    transfer").
-7. **Write CI context** — `/workspace/.containarium/ci-context.json` (repo, PR,
+7. **Write CI context** — `~/work/.containarium/ci-context.json` (repo, PR,
    commit, run URL) so an agent attached to a failing box has context.
-8. **Run `setup`** then **`test`** — over SSH, `cd /workspace && <cmd>`.
+8. **Run `setup`** then **`test`** — over SSH, `cd ~/work && <cmd>`.
 9. **Expose** (only if `serve:` is defined) — wire a public preview hostname.
 10. **Teardown on success** — `DELETE /v1/containers/<box>`.
 11. **On failure** (PR + `keep-on-failure`) — keep the box alive, refresh the
@@ -64,38 +64,44 @@ that produced `ssh: Could not resolve hostname <box-name>`.
 
 At create we send the **public key's contents** in `sshKeys`. The daemon bakes
 that key into the box and registers the box's jump-server account, so sshpiper
-authenticates the runner's private key and proxies into the box (login is
-`root`).
+authenticates the runner's private key and proxies into the box. The login is a
+**non-root** box user, so we work under its home (`~/work`), not at the
+filesystem root — `mkdir /workspace` fails with `Permission denied`.
 
 > ⚠️ Send the key **contents**, not the file path. `sshKeys: [<path-to>.pub]`
 > stores the literal path as the "key"; the daemon then rejects every create
 > with `ssh_keys[0]: not a valid SSH public key: ssh: no key found`. Always
 > `cat` the `.pub` file into the request.
 
-## Source transfer: tar-over-ssh (and why not rsync)
+## Source transfer: `containarium sync` (use the platform primitive)
 
-We copy the working tree with a **tar stream piped over ssh**:
+We push the working tree with the platform's own source-sync primitive — the
+`containarium sync` CLI, which is the same code behind the MCP `sync`/`push`
+tools:
 
 ```bash
-ssh $SSHOPTS "$T" "mkdir -p /workspace"
-tar -czf - . | ssh $SSHOPTS "$T" "tar -xzf - -C /workspace"
+containarium sync "$SSH_USER" . --sentinel "$SSH_HOST" --key "$SSH_KEY"
 ```
 
-Why tar and not the obvious alternatives:
+It mirrors the local tree into the box's default **`~/work`** over the same
+`sentinel → sshpiper → box` SSH path, then `setup`/`test` run with `cd ~/work`.
 
-- **Not `rsync`.** Base box images ship `tar` but **not** `rsync`. rsync needs
-  its binary on *both* ends, so an rsync push dies with
-  `rsync: command not found` → `rsync error: ... protocol data stream (code 12)`.
-  We don't require rsync — we deliberately avoid it. (`tar` and `gzip` are in
-  effectively every base image.)
-- **Not `scp -r`.** Slower, no stream compression, and clumsy excludes.
-- **`--delete` isn't needed.** Every CI run gets a *fresh* box, so `/workspace`
-  starts empty and a plain extract is equivalent to `rsync --delete`. (If warm
-  box reuse lands later, revisit this — that's when an incremental, delete-aware
-  sync would matter, and we'd install rsync explicitly or use a sync tool we
-  ship into the box.)
+Why this and not a hand-rolled transfer (we tried both and hit walls):
 
-`/workspace` is writable because the SSH login is `root`.
+- **Not `rsync`.** Base box images ship `tar` but **not** `rsync`, so an rsync
+  push dies with `rsync: command not found` → protocol error code 12. (`sync`
+  itself uses **tar-over-ssh** under the hood for exactly this reason.)
+- **Not a raw `tar` to `/workspace`.** The box logs us in as a **non-root**
+  user, so `mkdir /workspace` → `Permission denied`. `sync` targets the
+  home-relative `~/work`, which is writable whatever user the box assigns.
+- **`sync`, not `push`.** `containarium push` is real `git push` and **refuses
+  a detached HEAD** (`detached HEAD; pass --branch`). CI's checkout is a
+  *shallow, detached* merge ref, so `sync` — which mirrors the working tree with
+  no git/branch ceremony — is the right one here.
+- **Don't reinvent it.** The runner can't call MCP tools (no MCP client in the
+  GHA bash env), but the CLI behind them is installed and does the right thing —
+  workdir, transport, excludes, optional `--delete`. Reach for `containarium
+  sync`/`push` before hand-rolling ssh plumbing.
 
 ## Why curl (not the CLI) for create/delete
 
