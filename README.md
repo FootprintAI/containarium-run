@@ -93,14 +93,19 @@ test:                        # required — your actual test command
 serve:                       # optional — for PR preview environments
   command: <shell command>
   port: <int>
+resources:                   # optional — right-size the box (see docs/RUNNERS.md)
+  cpu: <cores>               #   overrides the box-cpu action input
+  memory: <size>             #   overrides box-memory
+  disk: <size>               #   overrides box-disk
 ```
 
-Three fields (plus the optional `serve:`). Resist adding a fourth in
-v1.x unless the use case is universal.
+The core is three fields — `image` + `setup` + `test`; `serve:` and
+`resources:` are the only optional blocks. Resist adding more in v1.x
+unless the use case is universal.
 
 ## Self-hosted
 
-Same Action, different `api-url`:
+Same Action, point `server` at your instance:
 ```yaml
 - uses: FootprintAI/containarium-run@v1
   with:
