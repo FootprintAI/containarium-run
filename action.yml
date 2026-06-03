@@ -31,6 +31,23 @@ inputs:
     description: 'Path to containarium.yml in your repo.'
     required: false
     default: '.github/containarium.yml'
+  box-cpu:
+    # Right-size the CI box. Concurrency per backend host is roughly
+    # floor(host vCPU / box vCPU), so smaller boxes pack more parallel
+    # jobs per host. A `resources:` block in containarium.yml overrides
+    # these per-role (see docs/RUNNERS.md). Defaults preserve the prior
+    # 4 / 4GB / 50GB behaviour.
+    description: 'CPU cores for the box (e.g. "2"). Overridden by a resources.cpu in containarium.yml. Default 4.'
+    required: false
+    default: '4'
+  box-memory:
+    description: 'Memory for the box (e.g. "2GB"). Overridden by resources.memory in containarium.yml. Default 4GB.'
+    required: false
+    default: '4GB'
+  box-disk:
+    description: 'Disk for the box (e.g. "50GB"). Overridden by resources.disk in containarium.yml. Default 50GB.'
+    required: false
+    default: '50GB'
   cache-key:
     # Plain text only — GHA evaluates ${{ }} expressions in input
     # descriptions, and hashFiles() is a workflow-context function not
@@ -156,12 +173,21 @@ runs:
         serve      = d.get("serve") or {}
         serve_cmd  = serve.get("command", "") if isinstance(serve, dict) else ""
         serve_port = serve.get("port", "")    if isinstance(serve, dict) else ""
+        # Optional per-role box sizing. Empty here → the create step falls
+        # back to the box-cpu/box-memory/box-disk action inputs.
+        res        = d.get("resources") or {}
+        res_cpu    = res.get("cpu", "")    if isinstance(res, dict) else ""
+        res_mem    = res.get("memory", "") if isinstance(res, dict) else ""
+        res_disk   = res.get("disk", "")   if isinstance(res, dict) else ""
         for var, val in [
             ("IMAGE",      image),
             ("SETUP",      setup),
             ("TEST",       test_cmd),
             ("SERVE_CMD",  serve_cmd),
             ("SERVE_PORT", str(serve_port) if serve_port != "" else ""),
+            ("RES_CPU",    str(res_cpu)  if res_cpu  != "" else ""),
+            ("RES_MEM",    str(res_mem)  if res_mem  != "" else ""),
+            ("RES_DISK",   str(res_disk) if res_disk != "" else ""),
         ]:
             print(f"{var}={shlex.quote(str(val))}")
         PY
@@ -172,6 +198,9 @@ runs:
           echo "test<<EOF";  echo "$TEST";  echo "EOF"
           echo "serve-cmd=$SERVE_CMD"
           echo "serve-port=$SERVE_PORT"
+          echo "res-cpu=$RES_CPU"
+          echo "res-memory=$RES_MEM"
+          echo "res-disk=$RES_DISK"
         } >> "$GITHUB_OUTPUT"
 
     # ------------------------------------------------------------------
@@ -247,16 +276,27 @@ runs:
           exit 1
         fi
 
+        # Resolve box size: a resources: block in containarium.yml wins
+        # (per-role), else the box-cpu/box-memory/box-disk action inputs
+        # (workflow-level default), else the prior 4 / 4GB / 50GB. Smaller
+        # boxes pack more concurrent jobs per backend host — see
+        # docs/RUNNERS.md.
+        CPU="${{ steps.config.outputs.res-cpu }}";    [ -n "$CPU" ] || CPU="${{ inputs.box-cpu }}"
+        MEM="${{ steps.config.outputs.res-memory }}"; [ -n "$MEM" ] || MEM="${{ inputs.box-memory }}"
+        DISK="${{ steps.config.outputs.res-disk }}";  [ -n "$DISK" ] || DISK="${{ inputs.box-disk }}"
+        echo "box size: cpu=$CPU memory=$MEM disk=$DISK"
+
         # Build the create request body. Matches the daemon's REST schema
-        # (camelCase) and the CLI's historical flag defaults (cpu 4 /
-        # memory 4GB / disk 50GB) so behaviour is unchanged from the old
-        # `containarium create` invocation.
+        # (camelCase).
         body=$(jq -nc \
-          --arg u   "$BOX_NAME" \
-          --arg img "${{ steps.config.outputs.image }}" \
-          --arg key "$PUBKEY" \
+          --arg u    "$BOX_NAME" \
+          --arg img  "${{ steps.config.outputs.image }}" \
+          --arg key  "$PUBKEY" \
+          --arg cpu  "$CPU" \
+          --arg mem  "$MEM" \
+          --arg disk "$DISK" \
           '{username:$u, image:$img, sshKeys:[$key],
-            resources:{cpu:"4", memory:"4GB", disk:"50GB"}}')
+            resources:{cpu:$cpu, memory:$mem, disk:$disk}}')
 
         # Idempotent create via the REST API over curl (HTTP/1.1).
         #
