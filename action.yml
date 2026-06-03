@@ -451,12 +451,14 @@ runs:
         SSH_USER="${{ steps.create.outputs.ssh-user }}"
         SSH_HOST="${{ steps.create.outputs.ssh-host }}"
         SSH_KEY="${{ steps.sshkey.outputs.priv }}"
-        # TODO: pick a stable workdir convention for CI runs (e.g. /workspace).
-        # Confirm the box's default user has write access there, or chown on
-        # first push.
-        rsync -az --delete \
-          -e "ssh -i $SSH_KEY -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o BatchMode=yes" \
-          ./ "${SSH_USER}@${SSH_HOST}:/workspace/"
+        SSHOPTS="-i $SSH_KEY -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o BatchMode=yes"
+        # Push the working tree via tar-over-ssh rather than rsync: base box
+        # images ship tar but NOT rsync (the rsync push failed with
+        # "rsync: command not found" → exit 12). Login is root, so /workspace
+        # is writable. A fresh box starts empty, so a plain extract is
+        # equivalent to rsync --delete here.
+        ssh $SSHOPTS "${SSH_USER}@${SSH_HOST}" "mkdir -p /workspace"
+        tar -czf - . | ssh $SSHOPTS "${SSH_USER}@${SSH_HOST}" "tar -xzf - -C /workspace"
 
     # ------------------------------------------------------------------
     # 5. Write CI context file into the box.

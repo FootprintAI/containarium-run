@@ -55,6 +55,9 @@ test:
 - **Debug on failure**: when a test fails, the box stays alive for an hour and a comment is posted on your PR with an SSH command and an [agent-box](https://github.com/FootprintAI/containarium/tree/main/cmd/agent-box) MCP URL. Connect from Claude Code, Cursor, or any MCP client and debug in place.
 - **Preview environments** (optional): add a `serve:` block to `containarium.yml` and the action exposes the port on a public HTTPS subdomain for the duration of the run.
 
+> How the box lifecycle, SSH identity model, and source transfer actually work
+> (and *why*) — see [docs/FLOW.md](docs/FLOW.md).
+
 ## Inputs
 
 | Name | Required | Default | Description |
