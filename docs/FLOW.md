@@ -73,49 +73,38 @@ filesystem root — `mkdir /workspace` fails with `Permission denied`.
 > with `ssh_keys[0]: not a valid SSH public key: ssh: no key found`. Always
 > `cat` the `.pub` file into the request.
 
-## Source transfer: `containarium sync` (use the platform primitive)
+## Source transfer: tar-over-ssh into `~/work`
 
-We push the working tree with the platform's own source-sync primitive — the
-`containarium sync` CLI, which is the same code behind the MCP `sync`/`push`
-tools:
+We push the working tree with a `tar` stream over ssh into the login user's
+`~/work`:
 
 ```bash
-BOX_HOME=$(ssh $SSHOPTS "$SSH_USER@$SSH_HOST" 'printf %s "$HOME"')
-containarium sync "$SSH_USER" . --remote-path "$BOX_HOME/work" --sentinel "$SSH_HOST" --key "$SSH_KEY"
+tar -czf - . | ssh $SSHOPTS "$SSH_USER@$SSH_HOST" "mkdir -p ~/work && tar -xzf - -C ~/work"
 ```
 
-It mirrors the local tree into **`~/work`** over the same
-`sentinel → sshpiper → box` SSH path, then `setup`/`test` run with `cd ~/work`.
+`~` expands to the `cld-<id>` login user's writable home, and combining
+`mkdir` + extract in one remote command makes it cwd-independent. Then
+`setup`/`test` run with `cd ~/work`.
 
-> ⚠️ `--remote-path` must be an **absolute** `<home>/work`, resolved from the
-> box's real `$HOME`. Two traps otherwise:
-> 1. `sync`'s **default** is `/home/<username>/work` — it assumes the box logs
->    you in as the cloud username (`cld-<id>`). **It doesn't**: login is the
->    box's own non-root user, whose home is *not* `/home/cld-<id>`, so the
->    default `mkdir` fails with `read remote manifest: ... exit status 1`.
-> 2. a **relative** path resolves against the ssh session's cwd, which isn't
->    guaranteed to be `$HOME`.
->
-> Resolving `$HOME` over ssh and passing `<home>/work` dodges both — it's the
-> same dir `cd ~/work` hits. (Worth fixing upstream so cloud boxes log in as
-> their `cld-<id>` user, then `sync`'s default would Just Work.)
-
-Why this and not a hand-rolled transfer (we tried both and hit walls):
+Why tar, and not the obvious alternatives:
 
 - **Not `rsync`.** Base box images ship `tar` but **not** `rsync`, so an rsync
-  push dies with `rsync: command not found` → protocol error code 12. (`sync`
-  itself uses **tar-over-ssh** under the hood for exactly this reason.)
-- **Not a raw `tar` to `/workspace`.** The box logs us in as a **non-root**
-  user, so `mkdir /workspace` → `Permission denied`. `sync` targets the
-  home-relative `~/work`, which is writable whatever user the box assigns.
-- **`sync`, not `push`.** `containarium push` is real `git push` and **refuses
-  a detached HEAD** (`detached HEAD; pass --branch`). CI's checkout is a
-  *shallow, detached* merge ref, so `sync` — which mirrors the working tree with
-  no git/branch ceremony — is the right one here.
-- **Don't reinvent it.** The runner can't call MCP tools (no MCP client in the
-  GHA bash env), but the CLI behind them is installed and does the right thing —
-  workdir, transport, excludes, optional `--delete`. Reach for `containarium
-  sync`/`push` before hand-rolling ssh plumbing.
+  push dies with `rsync: command not found` → protocol error code 12.
+- **Not `/workspace`.** The box logs us in as a non-root user, so `mkdir
+  /workspace` → `Permission denied`. `~/work` is the login user's home,
+  writable whatever user the box assigns.
+- **Not `containarium sync` (yet).** It's the *right* tool in principle — the
+  platform's own primitive (the CLI behind the MCP `sync`/`push` tools),
+  tar-based, with diffing + `--delete`. But its first step reads a remote
+  manifest (`find` + `sha256sum` at the remote path), and that **fails in the
+  cloud box's ssh session** with an opaque `read remote manifest: ssh manifest:
+  exit status 1` — even though the identical script runs fine via `su -
+  <cld-user>` on the box, and there's no flag to skip the manifest read. Filed
+  upstream; tar only needs `mkdir` + extract, so it sidesteps it. Reach back
+  for `sync` once the session-specific manifest failure is resolved.
+- **Not `containarium push`.** Real `git push`, and it **refuses a detached
+  HEAD** (`detached HEAD; pass --branch`); CI's checkout is a shallow, detached
+  merge ref.
 
 ## Why curl (not the CLI) for create/delete
 
