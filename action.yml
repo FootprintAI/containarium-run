@@ -237,6 +237,16 @@ runs:
           return 1
         }
 
+        # sshKeys must be the public key's CONTENTS, not the file path.
+        # steps.sshkey.outputs.pub is the PATH to the .pub file, so read it
+        # here. (Sending the path made the daemon reject the create with
+        # "ssh_keys[0]: not a valid SSH public key: ssh: no key found".)
+        PUBKEY=$(cat "${{ steps.sshkey.outputs.pub }}")
+        if [ -z "$PUBKEY" ]; then
+          echo "::error::public key file ${{ steps.sshkey.outputs.pub }} is empty/missing"
+          exit 1
+        fi
+
         # Build the create request body. Matches the daemon's REST schema
         # (camelCase) and the CLI's historical flag defaults (cpu 4 /
         # memory 4GB / disk 50GB) so behaviour is unchanged from the old
@@ -244,7 +254,7 @@ runs:
         body=$(jq -nc \
           --arg u   "$BOX_NAME" \
           --arg img "${{ steps.config.outputs.image }}" \
-          --arg key "${{ steps.sshkey.outputs.pub }}" \
+          --arg key "$PUBKEY" \
           '{username:$u, image:$img, sshKeys:[$key],
             resources:{cpu:"4", memory:"4GB", disk:"50GB"}}')
 
