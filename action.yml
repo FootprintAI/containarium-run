@@ -454,12 +454,19 @@ runs:
         # Use the platform's own source-sync primitive — `containarium sync`,
         # the CLI behind the MCP `sync`/`push` tools — instead of hand-rolling
         # the transfer. It mirrors the working tree via tar-over-ssh (box
-        # images lack rsync) into the box's default ~/work over the SAME
-        # sentinel → sshpiper → box path, as a NON-root user (so it sidesteps
-        # the "/workspace: Permission denied" we'd hit writing at the root).
+        # images lack rsync) over the SAME sentinel → sshpiper → box path.
         # `sync` (not `push`) because CI's checkout is a shallow, detached
         # merge ref — sync mirrors the tree with no git/branch ceremony.
+        #
+        # --remote-path is a RELATIVE `work` on purpose. sync's default
+        # resolves to /home/<username>/work — i.e. it assumes the box logs us
+        # in as the cloud username (cld-<id>). It doesn't: the box logs us in
+        # as its own non-root default user, whose home is NOT /home/cld-<id>,
+        # so that default mkdir fails ("read remote manifest: exit status 1").
+        # A relative path lands in the LOGIN user's $HOME/work — the same dir
+        # `cd ~/work` (setup/test) resolves to.
         containarium sync "$SSH_USER" . \
+          --remote-path work \
           --sentinel "$SSH_HOST" \
           --key "$SSH_KEY"
 
