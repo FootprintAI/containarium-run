@@ -48,6 +48,10 @@ inputs:
     description: 'Disk for the box (e.g. "50GB"). Overridden by resources.disk in containarium.yml. Default 50GB.'
     required: false
     default: '50GB'
+  ssh-ready-timeout:
+    description: 'Seconds to wait for the box''s sshd to accept SSH after it reaches RUNNING. The box can be RUNNING before the sentinel has propagated its key (keysync polls on an interval), so this absorbs that window. Raise it when many boxes are created in parallel (e.g. a high-concurrency CI matrix) and some time out before the sentinel catches up. Default 240.'
+    required: false
+    default: '240'
   cache-key:
     # Plain text only — GHA evaluates ${{ }} expressions in input
     # descriptions, and hashFiles() is a workflow-context function not
@@ -426,6 +430,7 @@ runs:
       env:
         CONTAINARIUM_SERVER: ${{ inputs.server }}
         CONTAINARIUM_TOKEN:  ${{ inputs.token }}
+        SSH_READY_TIMEOUT:   ${{ inputs.ssh-ready-timeout }}
       run: |
         set -euo pipefail
         SSH_USER="${{ steps.create.outputs.ssh-user }}"
@@ -455,8 +460,12 @@ runs:
 
         # 2) Wait until sshd answers. A no-op ssh is the honest readiness
         #    probe — RUNNING means the box exists; sshpiper + the box's sshd
-        #    may need a few more seconds.
-        ssh_deadline=$(( $(date +%s) + 120 ))
+        #    may need a few more seconds. The box can be RUNNING before the
+        #    sentinel has propagated its key (keysync runs on an interval),
+        #    so this window must cover that — and widen under parallel box
+        #    creation, where keysync lags. Tunable via ssh-ready-timeout.
+        ssh_wait="${SSH_READY_TIMEOUT:-240}"
+        ssh_deadline=$(( $(date +%s) + ssh_wait ))
         until ssh -i "$SSH_KEY" \
                   -o StrictHostKeyChecking=accept-new \
                   -o IdentitiesOnly=yes \
@@ -464,7 +473,7 @@ runs:
                   -o ConnectTimeout=10 \
                   "${SSH_USER}@${SSH_HOST}" true 2>/dev/null; do
           if [ "$(date +%s)" -ge "$ssh_deadline" ]; then
-            echo "::error::box ${SSH_USER}@${SSH_HOST} did not accept SSH within 120s"
+            echo "::error::box ${SSH_USER}@${SSH_HOST} did not accept SSH within ${ssh_wait}s"
             exit 1
           fi
           echo "waiting for sshd at ${SSH_USER}@${SSH_HOST}..."
