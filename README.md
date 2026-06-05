@@ -68,6 +68,7 @@ test:
 | `box-cpu` | No | `4` | CPU cores for the box. Smaller boxes pack more parallel jobs per backend host (see [docs/RUNNERS.md](docs/RUNNERS.md)). A `resources.cpu` in `containarium.yml` overrides this per-role. |
 | `box-memory` | No | `4GB` | Memory for the box. Overridden by `resources.memory` in `containarium.yml`. |
 | `box-disk` | No | `50GB` | Disk for the box. Overridden by `resources.disk` in `containarium.yml`. |
+| `ssh-ready-timeout` | No | `240` | Seconds to wait for the box's sshd to accept SSH after it reaches RUNNING (a box can be RUNNING before the server has propagated its key). Raise it when many jobs create boxes in parallel — under a high-concurrency CI matrix, key propagation lags and the default window can be too short. |
 | `cache-key` | No | — | *(planned; not in v1)* Cache key to reuse a warm box across runs (e.g. `${{ hashFiles('go.sum') }}`). |
 | `keep-on-failure` | No | `true` | On test failure, keep box alive 1h and post a debug comment on the PR. |
 | `org-id` | No | — | Cloud org UUID. When set, debug-box endpoint info (SSH host/port/user, MCP URL, keep-alive deadline) is reported back to the cloud's CI dashboard on test failure so the `/ci/runs/<id>` panel renders real connection info. Skipped silently when empty — preserves backwards-compat for users who haven't run the onboarding wizard. |
