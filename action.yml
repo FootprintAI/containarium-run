@@ -61,9 +61,31 @@ inputs:
     required: false
     default: ''
   keep-on-failure:
-    description: 'On failure, keep the box alive for 1h and post a PR comment with SSH + MCP debug URLs.'
+    description: 'On failure, keep the box alive for the debug-ttl window and post a PR comment with SSH + MCP debug URLs.'
     required: false
     default: 'true'
+  lease-ttl:
+    # The box is created with this TTL (a "birth TTL") and a background
+    # heartbeat renews it every lease-ttl/2 while the job runs. The moment
+    # the job ends — success, failure, CANCELLATION, or the runner dying —
+    # the heartbeat stops and the box self-reaps within one window. This is
+    # the blanket leak guard: a cancelled/crashed job that reaches neither
+    # the success-teardown nor the failure-keep step still goes away on its
+    # own. Keep it comfortably longer than 2× the renew interval; a longer
+    # value tolerates a slow control plane, a shorter one reclaims faster
+    # after a crash. Accepts Go-ish durations ("20m", "1h", "900s") or bare
+    # seconds.
+    description: 'Birth/lease TTL renewed by a heartbeat while the job runs; the box self-reaps within one window once the job ends or the runner dies. Default 20m.'
+    required: false
+    default: '20m'
+  debug-ttl:
+    # On failure, the lease is replaced with this (longer) bounded window so
+    # a human/agent can SSH in to debug before the box self-reaps. Capped by
+    # the daemon at 7 days; never infinite — that's the whole point. Accepts
+    # Go-ish durations or bare seconds.
+    description: 'On failure, how long to keep the box alive for debugging before it self-reaps. Default 1h.'
+    required: false
+    default: '1h'
   org-id:
     # Optional for v0: when set, the runner reports debug-box metadata
     # back to the cloud's CI dashboard on test failure (powers the
@@ -415,6 +437,104 @@ runs:
         } >> "$GITHUB_OUTPUT"
 
     # ------------------------------------------------------------------
+    # 3b-ttl. Start the TTL lease: stamp a birth TTL NOW and renew it in
+    # the background while the job runs.
+    #
+    # This is the blanket leak guard (#526). Today the box only gets a TTL
+    # on the failure path, so a job that is CANCELLED or whose runner dies
+    # between create and the success/failure steps reaches neither teardown
+    # nor the failure-keep TTL and leaks forever. By stamping a short TTL at
+    # birth and renewing it on a heartbeat, the box is ALWAYS reaped within
+    # one window once the heartbeat stops — which it does on job end, cancel,
+    # or runner death. The always() "Stop TTL lease" step kills the heartbeat
+    # before the final-state TTL (success → delete, failure → debug window)
+    # so that final state wins.
+    #
+    # We use SetContainerTTL (POST /ttl) for both the birth stamp and each
+    # renew because its semantics are renew-from-now (ttl_expires_at =
+    # now()+duration), exactly a lease. (Birth-TTL-at-create — atomic, no
+    # create→stamp window — lands once FootprintAI/Containarium#523 ships in
+    # a release and the cloud forwards ttl_seconds; until then this explicit
+    # stamp one RPC after create is the robust, ships-today path.)
+    # ------------------------------------------------------------------
+    - name: Start TTL lease (birth TTL + heartbeat)
+      shell: bash
+      id: lease
+      env:
+        CONTAINARIUM_SERVER: ${{ inputs.server }}
+        CONTAINARIUM_TOKEN:  ${{ inputs.token }}
+        LEASE_TTL:           ${{ inputs.lease-ttl }}
+        DEBUG_TTL:           ${{ inputs.debug-ttl }}
+      run: |
+        set -euo pipefail
+        SSH_USER="${{ steps.create.outputs.ssh-user }}"
+
+        # Accept Go-ish durations ("20m", "1h", "90s") or bare seconds.
+        to_seconds() {
+          local v="$1"
+          if [[ "$v" =~ ^[0-9]+$ ]];          then echo "$v"; return 0; fi
+          if [[ "$v" =~ ^([0-9]+)s$ ]];       then echo "${BASH_REMATCH[1]}"; return 0; fi
+          if [[ "$v" =~ ^([0-9]+)m$ ]];       then echo "$(( BASH_REMATCH[1] * 60 ))"; return 0; fi
+          if [[ "$v" =~ ^([0-9]+)h$ ]];       then echo "$(( BASH_REMATCH[1] * 3600 ))"; return 0; fi
+          return 1
+        }
+        LEASE_SECONDS=$(to_seconds "$LEASE_TTL") || { echo "::error::invalid lease-ttl '$LEASE_TTL' (use e.g. 20m, 1h, 900s)"; exit 1; }
+        DEBUG_SECONDS=$(to_seconds "$DEBUG_TTL") || { echo "::error::invalid debug-ttl '$DEBUG_TTL' (use e.g. 1h, 30m, 3600)"; exit 1; }
+        # Renew at half the window so a single missed beat still leaves margin.
+        INTERVAL_SECONDS=$(( LEASE_SECONDS / 2 )); [ "$INTERVAL_SECONDS" -ge 1 ] || INTERVAL_SECONDS=1
+        # Expose the resolved debug window to the failure step (avoids parsing
+        # the duration twice and keeps the cap in one place).
+        echo "debug-seconds=$DEBUG_SECONDS" >> "$GITHUB_OUTPUT"
+
+        # set_ttl <seconds>: POST the lease window; the box is keyed by the
+        # cloud username (cld-<id>). HTTP/1.1 for the same #422 reason as
+        # create/delete. Prints the HTTP code on non-2xx for the caller.
+        set_ttl() {
+          local secs="$1" code
+          code=$(curl -sS --http1.1 -m 30 -o /dev/null -w '%{http_code}' \
+            -X POST "${CONTAINARIUM_SERVER%/}/v1/containers/${SSH_USER}/ttl" \
+            -H "authorization: Bearer ${CONTAINARIUM_TOKEN}" \
+            -H 'content-type: application/json' \
+            -d "{\"durationSeconds\": ${secs}}" 2>/dev/null || echo 000)
+          case "$code" in 200|201|204) return 0 ;; *) echo "$code"; return 1 ;; esac
+        }
+
+        # Birth TTL: stamp synchronously NOW so even if the runner dies during
+        # the long image-pull / wait-ready, the box self-reaps within the
+        # lease window. A server predating SetContainerTTL returns 501 — warn
+        # and continue (the box falls back to today's no-birth-TTL behavior;
+        # success-delete still works), never fail the build over it.
+        if rc=$(set_ttl "$LEASE_SECONDS"); then
+          echo "birth TTL stamped on '${SSH_USER}' (${LEASE_SECONDS}s); renewing every ${INTERVAL_SECONDS}s"
+        else
+          echo "::warning::could not stamp birth TTL on '${SSH_USER}' (HTTP ${rc}); the box may rely on later renews or need manual cleanup on a server without TTL support"
+        fi
+
+        # Heartbeat: a background loop renews the lease while the job runs.
+        # It persists across subsequent steps (the runner doesn't reap
+        # background processes until job cleanup) and reads the server/token
+        # from the inherited env (a quoted heredoc — so the token is NOT
+        # written to disk). The always() "Stop TTL lease" step kills it.
+        export SSH_USER LEASE_SECONDS INTERVAL_SECONDS
+        HB="${RUNNER_TEMP}/ttl-heartbeat.sh"
+        cat > "$HB" <<'EOF'
+        #!/usr/bin/env bash
+        while true; do
+          sleep "${INTERVAL_SECONDS}"
+          curl -sS --http1.1 -m 30 -o /dev/null \
+            -X POST "${CONTAINARIUM_SERVER%/}/v1/containers/${SSH_USER}/ttl" \
+            -H "authorization: Bearer ${CONTAINARIUM_TOKEN}" \
+            -H 'content-type: application/json' \
+            -d "{\"durationSeconds\": ${LEASE_SECONDS}}" >/dev/null 2>&1 || true
+        done
+        EOF
+        chmod +x "$HB"
+        nohup bash "$HB" >"${RUNNER_TEMP}/ttl-heartbeat.log" 2>&1 &
+        echo $! > "${RUNNER_TEMP}/ttl-heartbeat.pid"
+        disown || true
+        echo "TTL lease heartbeat started (pid $(cat "${RUNNER_TEMP}/ttl-heartbeat.pid"))"
+
+    # ------------------------------------------------------------------
     # 3c. Wait for the box to be RUNNING and SSH-reachable.
     #
     # Create is ASYNC: the cloud parks the request and a regional daemon
@@ -683,6 +803,35 @@ runs:
         echo "url=https://$PREVIEW_DOMAIN" >> "$GITHUB_OUTPUT"
 
     # ------------------------------------------------------------------
+    # 8b. Stop the TTL lease heartbeat.
+    #
+    # always() so it runs on success, failure, AND cancellation — it must
+    # stop renewing BEFORE the final-state TTL is written, or the heartbeat
+    # would overwrite the failure debug window back down to the lease window.
+    # On cancellation the success/failure steps below are skipped, so the box
+    # keeps the last lease the heartbeat set and self-reaps within one window
+    # — exactly the cancelled-job leak this closes (#526). Best-effort: a
+    # missing pid file (heartbeat never started) is a no-op.
+    # ------------------------------------------------------------------
+    - name: Stop TTL lease heartbeat
+      shell: bash
+      if: always()
+      run: |
+        set -euo pipefail
+        PIDFILE="${RUNNER_TEMP}/ttl-heartbeat.pid"
+        if [ -f "$PIDFILE" ]; then
+          PID="$(cat "$PIDFILE" 2>/dev/null || true)"
+          if [ -n "${PID:-}" ] && kill "$PID" 2>/dev/null; then
+            echo "stopped TTL lease heartbeat (pid $PID); box will reap at its last lease unless a final TTL is set below"
+          else
+            echo "TTL lease heartbeat (pid ${PID:-?}) was not running"
+          fi
+          rm -f "$PIDFILE"
+        else
+          echo "no TTL lease heartbeat to stop"
+        fi
+
+    # ------------------------------------------------------------------
     # 9. SUCCESS PATH — tear down the box.
     # ------------------------------------------------------------------
     - name: Tear down box (success)
@@ -724,6 +873,8 @@ runs:
         CONTAINARIUM_HTTP:   'true'
         CONTAINARIUM_SERVER: ${{ inputs.server }}
         CONTAINARIUM_TOKEN:  ${{ inputs.token }}
+        DEBUG_TTL:           ${{ inputs.debug-ttl }}
+        DEBUG_SECONDS:       ${{ steps.lease.outputs.debug-seconds }}
       run: |
         set -euo pipefail
         SSH_USER="${{ steps.create.outputs.ssh-user }}"
@@ -763,29 +914,31 @@ runs:
           scp -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes /tmp/ci-context.json "${SSH_USER}@${SSH_HOST}:~/work/.containarium/ci-context.json" || true
         fi
 
-        # Schedule auto-delete in 1h so the kept-alive debug box self-reaps
-        # instead of leaking until someone deletes it by hand. The cloud
-        # serves the OSS contract's SetContainerTTL RPC at
-        # POST /v1/containers/<name>/ttl (FootprintAI/Containarium, server
-        # handler in internal/server/container_server_ttl.go) — body is
-        # {"durationSeconds": N}, the box is keyed by the cloud username
-        # (cld-<id>), and the daemon's ttlsweeper force-deletes once the
-        # wall clock passes now()+N. 3600s matches the "expires in 60
-        # minutes" the debug comment below promises.
+        # Replace the short lease with the (longer) bounded debug window so
+        # the kept-alive box self-reaps after debugging instead of leaking.
+        # The lease heartbeat was already stopped by the always() "Stop TTL
+        # lease" step above, so this set is the final word (otherwise the
+        # heartbeat would renew it straight back down to the lease window).
+        # The cloud serves the OSS contract's SetContainerTTL RPC at
+        # POST /v1/containers/<name>/ttl — body {"durationSeconds": N}, box
+        # keyed by the cloud username (cld-<id>), and the daemon's ttlsweeper
+        # force-deletes once the wall clock passes now()+N. Bounded by the
+        # daemon at 7 days; never infinite.
         #
         # Best-effort, same as teardown: a failed TTL stamp must not turn an
         # already-red build into a different red. A server that predates the
         # handler returns 501 (Unimplemented) — we warn and the box falls
         # back to manual cleanup rather than failing the step. curl over
         # HTTP/1.1 for the same #422 reason as create/delete.
+        DEBUG_SECONDS="${DEBUG_SECONDS:-3600}"
         code=$(curl -sS --http1.1 -m 60 -o /dev/null -w '%{http_code}' \
           -X POST "${CONTAINARIUM_SERVER%/}/v1/containers/${SSH_USER}/ttl" \
           -H "authorization: Bearer ${CONTAINARIUM_TOKEN}" \
           -H 'content-type: application/json' \
-          -d '{"durationSeconds": 3600}' 2>/dev/null || echo 000)
+          -d "{\"durationSeconds\": ${DEBUG_SECONDS}}" 2>/dev/null || echo 000)
         case "$code" in
-          200|201|204) echo "box '${SSH_USER}' will auto-delete in 1h (TTL set, HTTP ${code})" ;;
-          *) echo "::warning::could not set 1h auto-delete TTL on '${SSH_USER}' (HTTP ${code}) — box may leak until manually deleted" ;;
+          200|201|204) echo "box '${SSH_USER}' will auto-delete in ${DEBUG_TTL} (TTL set, HTTP ${code})" ;;
+          *) echo "::warning::could not set ${DEBUG_TTL} auto-delete TTL on '${SSH_USER}' (HTTP ${code}) — box may leak until manually deleted" ;;
         esac
 
         # Connection info is the REAL identity resolved at create: the
@@ -809,7 +962,7 @@ runs:
         BODY=$(cat <<EOF
         ### ❌ CI failed — box kept alive for debugging
 
-        **Debug this box live** (expires in 60 minutes)
+        **Debug this box live** (expires in ${DEBUG_TTL})
 
         \`\`\`bash
         # SSH in
@@ -876,6 +1029,7 @@ runs:
         SSH_PORT:  ${{ steps.debug.outputs.ssh-port }}
         SSH_USER:  ${{ steps.debug.outputs.ssh-user }}
         MCP_URL:   ${{ steps.debug.outputs.mcp-url }}
+        DEBUG_SECONDS: ${{ steps.lease.outputs.debug-seconds }}
       run: |
         set -euo pipefail
         # Skip silently when the debug step didn't run (e.g. failure
@@ -885,10 +1039,10 @@ runs:
           echo "no debug box to report (debug step didn't run); skipping"
           exit 0
         fi
-        # Keep-alive window matches the PR-comment claim ("expires in
-        # 60 minutes"). Compute as an RFC-3339 timestamp the cloud's
-        # google.protobuf.Timestamp parser accepts directly.
-        KEEP_UNTIL=$(date -u -d '+60 minutes' '+%Y-%m-%dT%H:%M:%SZ')
+        # Keep-alive window matches the debug TTL the failure step actually
+        # stamped (steps.lease.outputs.debug-seconds). Compute as an RFC-3339
+        # timestamp the cloud's google.protobuf.Timestamp parser accepts.
+        KEEP_UNTIL=$(date -u -d "+${DEBUG_SECONDS:-3600} seconds" '+%Y-%m-%dT%H:%M:%SZ')
 
         # POST shape mirrors ReportCIJobRuntimeRequest in
         # proto/containarium/cloud/v1/ci_service.proto. container_id

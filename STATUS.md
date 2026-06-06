@@ -70,20 +70,26 @@ The action.yml should use `CONTAINARIUM_SERVER` (matching the existing
 flag), not `CONTAINARIUM_API_URL` — corrected in the same commit as
 this STATUS update.
 
-### 3. Box TTL / auto-delete — wired (v1.1.1)
-The failure path keeps the box alive for debugging, then stamps a 1h
-auto-delete so it self-reaps instead of leaking. The action POSTs
-`{"durationSeconds": 3600}` to the OSS contract's
-`POST /v1/containers/<cld-id>/ttl` (SetContainerTTL); the daemon's
-`ttlsweeper` force-deletes once the wall clock passes the expiry. The
-call is best-effort — a server predating the handler returns 501 and
-the step warns rather than failing the (already-red) build.
+### 3. Box TTL / auto-delete — wired; leak fully closed (#526)
+Every box is now **born with a lease TTL** and a background heartbeat
+renews it while the job runs (`lease-ttl`, default 20m, renewed every
+half-window). The moment the job ends — success, failure, **cancellation**,
+or the **runner dying** — the heartbeat stops and the box self-reaps within
+one window. On success the box is deleted immediately; on failure the lease
+is replaced with a longer bounded debug window (`debug-ttl`, default 1h) so
+a human/agent can SSH in before it self-reaps. All TTLs go through the OSS
+contract's `POST /v1/containers/<cld-id>/ttl` (SetContainerTTL — renew-from-
+now semantics = a lease); the daemon's `ttlsweeper` force-deletes at expiry.
+Best-effort throughout — a server predating the handler returns 501 and the
+steps warn rather than failing the (possibly already-red) build.
 
-Residual gap: this only covers the *kept-alive failure* box. A
-**cancelled** job (neither success nor failure) still skips both the
-success teardown and this failure-path TTL, so it can leak. Closing
-that needs an `if: always()` reaper or a TTL stamped at create time as
-a blanket safety net.
+This closes the **prior residual gap**: a cancelled job (neither success
+nor failure) used to skip both the success teardown and the failure-path
+TTL and leak forever. The birth TTL + heartbeat is exactly the "TTL stamped
+as a blanket safety net" that gap called for. (Atomic birth-TTL-at-create —
+no create→stamp window at all — lands once FootprintAI/Containarium#523 ships
+in a release and the cloud forwards `ttl_seconds`; until then the explicit
+stamp one RPC after create is the robust, ships-today path.)
 
 ## Blocked on Cloud API
 

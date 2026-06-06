@@ -23,6 +23,10 @@ Every job runs these steps (see [`action.yml`](../action.yml)):
 4. **Create the box** — `POST /v1/containers` over **curl/HTTP1.1** (not the
    CLI; see "Why curl" below). Async: returns immediately with the box in a
    `CREATING`/`PENDING` state.
+4b. **Start the TTL lease** — stamp a short birth TTL immediately and launch a
+   background heartbeat that renews it every half-window while the job runs.
+   This is the blanket leak guard (see "The lease" below): the box is always
+   reaped within one window once the heartbeat stops.
 5. **Wait until ready** — poll the cloud for `RUNNING`, then probe SSH until
    it answers. Create is async, so this avoids racing a half-provisioned box.
 6. **Push the working tree** — `containarium sync` into `~/work` (see "Source
@@ -31,10 +35,43 @@ Every job runs these steps (see [`action.yml`](../action.yml)):
    commit, run URL) so an agent attached to a failing box has context.
 8. **Run `setup`** then **`test`** — over SSH, `cd ~/work && <cmd>`.
 9. **Expose** (only if `serve:` is defined) — wire a public preview hostname.
+9b. **Stop the TTL lease heartbeat** (`always()`) — so the final-state TTL
+    below wins instead of being renewed back down to the lease window.
 10. **Teardown on success** — `DELETE /v1/containers/<box>`.
-11. **On failure** (PR + `keep-on-failure`) — keep the box alive, refresh the
-    CI context with the failing test + log tail, post a PR comment with the
-    SSH/MCP debug command, and report the debug box to the cloud dashboard.
+11. **On failure** (PR + `keep-on-failure`) — replace the lease with the
+    bounded `debug-ttl` window, refresh the CI context with the failing test
+    + log tail, post a PR comment with the SSH/MCP debug command, and report
+    the debug box to the cloud dashboard.
+
+## The lease: why every box is born dying
+
+The leak this Action used to have: a box only got a TTL on the *failure*
+path. A job that was **cancelled** (neither success nor failure) or whose
+**runner died** mid-run reached neither the success teardown nor the failure
+TTL — so the box ran forever. Push-event failures and the create→ready
+window (image pull) leaked too.
+
+The fix (`#526`) is a **lease**, not a one-shot:
+
+- **Birth TTL** — right after create, stamp a short `lease-ttl` (default
+  20m). Even if everything after this dies, the box self-reaps within the
+  window.
+- **Heartbeat** — a background loop renews the lease every `lease-ttl/2`
+  while the job runs, so a legitimately long job never gets reaped mid-run.
+  It persists across steps (the runner doesn't kill background processes
+  until job cleanup) and dies with the job / runner.
+- **`always()` stop** — before the final-state TTL, the heartbeat is killed
+  so the success-delete / failure-`debug-ttl` is the last word.
+
+Result: **success** → deleted immediately; **failure** → kept for `debug-ttl`
+(default 1h, bounded — never infinite) then self-reaps; **cancel / runner
+death** → no more renews, reaped within one lease window. No path leaks.
+
+Renew uses `SetContainerTTL` (`POST /ttl`), whose semantics are
+`ttl_expires_at = now() + duration` — i.e. renew-from-now, exactly a lease.
+(Atomic birth-TTL-*at-create* lands once FootprintAI/Containarium#523 ships
+in a release and the cloud forwards `ttl_seconds`; until then the explicit
+stamp one RPC after create is the robust, ships-today path.)
 
 ## The box-SSH identity model
 
