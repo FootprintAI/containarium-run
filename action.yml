@@ -263,6 +263,7 @@ runs:
         CONTAINARIUM_SERVER: ${{ inputs.server }}
         CONTAINARIUM_TOKEN:  ${{ inputs.token }}
         SSH_HOST_OVERRIDE:   ${{ inputs.ssh-host }}
+        LEASE_TTL:           ${{ inputs.lease-ttl }}
       run: |
         set -euo pipefail
         # Box name must satisfy the daemon's jump-server username validator:
@@ -312,8 +313,29 @@ runs:
         DISK="${{ steps.config.outputs.res-disk }}";  [ -n "$DISK" ] || DISK="${{ inputs.box-disk }}"
         echo "box size: cpu=$CPU memory=$MEM disk=$DISK"
 
+        # Birth TTL: stamp the lease window directly on the create request so
+        # the box is born with its TTL ATOMICALLY — no create→stamp window at
+        # all (FootprintAI/Containarium#523, in the cloud's create path as of
+        # OSS v0.24.0). On a cloud/daemon predating that, ttlSeconds is an
+        # unknown field the create decoder drops (protojson DiscardUnknown) —
+        # harmless, and the "Start TTL lease" step below still stamps it one
+        # RPC later, so there is NEVER a window where the box lacks a TTL
+        # regardless of the deployed version. Same Go-ish-duration → seconds
+        # parse as the lease step.
+        to_seconds() {
+          local v="$1"
+          if [[ "$v" =~ ^[0-9]+$ ]];    then echo "$v"; return 0; fi
+          if [[ "$v" =~ ^([0-9]+)s$ ]]; then echo "${BASH_REMATCH[1]}"; return 0; fi
+          if [[ "$v" =~ ^([0-9]+)m$ ]]; then echo "$(( BASH_REMATCH[1] * 60 ))"; return 0; fi
+          if [[ "$v" =~ ^([0-9]+)h$ ]]; then echo "$(( BASH_REMATCH[1] * 3600 ))"; return 0; fi
+          return 1
+        }
+        BIRTH_TTL_SECONDS=$(to_seconds "${LEASE_TTL:-20m}") || BIRTH_TTL_SECONDS=0
+
         # Build the create request body. Matches the daemon's REST schema
-        # (camelCase).
+        # (camelCase). ttlSeconds included only when parseable + positive so a
+        # bad lease-ttl input degrades to "no birth TTL in body" (the lease
+        # step still covers it) rather than a malformed request.
         body=$(jq -nc \
           --arg u    "$BOX_NAME" \
           --arg img  "${{ steps.config.outputs.image }}" \
@@ -321,8 +343,10 @@ runs:
           --arg cpu  "$CPU" \
           --arg mem  "$MEM" \
           --arg disk "$DISK" \
+          --argjson ttl "${BIRTH_TTL_SECONDS:-0}" \
           '{username:$u, image:$img, sshKeys:[$key],
-            resources:{cpu:$cpu, memory:$mem, disk:$disk}}')
+            resources:{cpu:$cpu, memory:$mem, disk:$disk}}
+           + (if $ttl > 0 then {ttlSeconds:$ttl} else {} end)')
 
         # Idempotent create via the REST API over curl (HTTP/1.1).
         #
@@ -501,8 +525,12 @@ runs:
 
         # Birth TTL: stamp synchronously NOW so even if the runner dies during
         # the long image-pull / wait-ready, the box self-reaps within the
-        # lease window. A server predating SetContainerTTL returns 501 — warn
-        # and continue (the box falls back to today's no-birth-TTL behavior;
+        # lease window. On a cloud/daemon at OSS v0.24.0+ the create body's
+        # ttlSeconds already set this atomically (no window at all); this
+        # re-set is the fallback for older deployments that dropped that field,
+        # and is in any case where the renew loop starts. Idempotent — it just
+        # re-sets the same window. A server predating SetContainerTTL returns
+        # 501 — warn and continue (box falls back to today's no-TTL behavior;
         # success-delete still works), never fail the build over it.
         if rc=$(set_ttl "$LEASE_SECONDS"); then
           echo "birth TTL stamped on '${SSH_USER}' (${LEASE_SECONDS}s); renewing every ${INTERVAL_SECONDS}s"
