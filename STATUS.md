@@ -86,10 +86,12 @@ steps warn rather than failing the (possibly already-red) build.
 This closes the **prior residual gap**: a cancelled job (neither success
 nor failure) used to skip both the success teardown and the failure-path
 TTL and leak forever. The birth TTL + heartbeat is exactly the "TTL stamped
-as a blanket safety net" that gap called for. (Atomic birth-TTL-at-create —
-no create→stamp window at all — lands once FootprintAI/Containarium#523 ships
-in a release and the cloud forwards `ttl_seconds`; until then the explicit
-stamp one RPC after create is the robust, ships-today path.)
+as a blanket safety net" that gap called for. The create request now also
+carries `ttlSeconds` directly, so on a cloud/daemon at **OSS v0.24.0+** the
+box is born with its TTL *atomically* (no create→stamp window at all,
+FootprintAI/Containarium#523); on older deployments that field is dropped and
+the lease step's synchronous stamp one RPC later covers it — a box is never
+without a TTL regardless of the deployed version.
 
 ## Blocked on Cloud API
 

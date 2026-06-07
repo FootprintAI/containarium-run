@@ -69,9 +69,14 @@ death** → no more renews, reaped within one lease window. No path leaks.
 
 Renew uses `SetContainerTTL` (`POST /ttl`), whose semantics are
 `ttl_expires_at = now() + duration` — i.e. renew-from-now, exactly a lease.
-(Atomic birth-TTL-*at-create* lands once FootprintAI/Containarium#523 ships
-in a release and the cloud forwards `ttl_seconds`; until then the explicit
-stamp one RPC after create is the robust, ships-today path.)
+
+The create request also carries `ttlSeconds` (the lease window) directly, so
+on a cloud/daemon at **OSS v0.24.0+** the box is born with its TTL *atomically*
+— there is no create→stamp window at all (FootprintAI/Containarium#523). On an
+older deployment that field is an unknown the create decoder drops, and the
+synchronous stamp in the lease step one RPC later covers it — so a box is never
+without a TTL regardless of the deployed version. Either way the heartbeat then
+renews from there.
 
 ## The box-SSH identity model
 
