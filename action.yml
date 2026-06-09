@@ -94,7 +94,20 @@ inputs:
     # users who haven't run the onboarding wizard yet (the wizard
     # will eventually write this as a repo variable alongside
     # CONTAINARIUM_TOKEN; for now operators set it manually).
-    description: 'Cloud org id (UUID). Optional; when set, debug-box info is reported back to the cloud dashboard on failure. Find it under /settings or by inspecting an existing /v1/orgs/{org}/... URL while signed in.'
+    description: 'Cloud org id (UUID). Optional; when set, debug-box info is reported back to the cloud dashboard on failure, AND CONTAINARIUM_ORG is forwarded into the box env (see `env` below). Find it under /settings or by inspecting an existing /v1/orgs/{org}/... URL while signed in.'
+    required: false
+    default: ''
+  env:
+    # Extra environment forwarded into the box's setup/test command env,
+    # on TOP of the always-forwarded CONTAINARIUM_SERVER / CONTAINARIUM_TOKEN
+    # / CONTAINARIUM_ORG. One KEY=VALUE per line. Values are masked in the
+    # logs and written to a mode-0600 file inside the box (never passed on
+    # the ssh argv), then sourced before the command runs. Use this for
+    # second-org credentials a box-CI role needs, e.g.
+    #   env: |
+    #     CONTAINARIUM_TOKEN_PEER=${{ secrets.CONTAINARIUM_TOKEN_PEER }}
+    #     CONTAINARIUM_ORG_PEER=${{ vars.CONTAINARIUM_ORG_PEER }}
+    description: 'Extra env forwarded into the box''s setup/test commands, one KEY=VALUE per line. CONTAINARIUM_SERVER/TOKEN/ORG are always forwarded; use this for extras (e.g. CONTAINARIUM_TOKEN_PEER). Values are masked and written to a 0600 file, not the ssh command line.'
     required: false
     default: ''
   ssh-host:
@@ -743,6 +756,74 @@ runs:
         scp -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes /tmp/ci-context.json "${SSH_USER}@${SSH_HOST}:~/work/.containarium/ci-context.json"
 
     # ------------------------------------------------------------------
+    # 5b. Forward cloud credentials into the box's command env.
+    #
+    # A box-CI role (actuation/isolation verifier) runs INSIDE the box and
+    # drives the cloud REST API — the box's LXC bridge is the only vantage
+    # on the cluster. It needs CONTAINARIUM_SERVER/TOKEN/ORG (and optionally
+    # a second org's creds) as ordinary env. Plain CI roles that just build
+    # the rsynced repo never read these; the file is harmless to them.
+    #
+    # Security: secrets must NOT land on the ssh argv (they'd show in the
+    # box's process listing and in Action logs). We build a mode-0600 file
+    # on the runner (umask 077), scp it over the existing channel, chmod it
+    # on the box for good measure, and have Run setup/test source it. Values
+    # are ::add-mask::'d so they can't echo into logs. The file is deleted on
+    # teardown (success deletes the whole box; the keep-on-failure path rm's
+    # it explicitly before the box is left reachable).
+    # ------------------------------------------------------------------
+    - name: Forward cloud credentials to box
+      shell: bash
+      env:
+        CONTAINARIUM_SERVER: ${{ inputs.server }}
+        CONTAINARIUM_TOKEN:  ${{ inputs.token }}
+        CONTAINARIUM_ORG:    ${{ inputs.org-id }}
+        EXTRA_ENV:           ${{ inputs.env }}
+      run: |
+        set -euo pipefail
+        SSH_USER="${{ steps.create.outputs.ssh-user }}"
+        SSH_HOST="${{ steps.create.outputs.ssh-host }}"
+        SSH_KEY="${{ steps.sshkey.outputs.priv }}"
+
+        # 0600 from birth — never world/group readable, even briefly.
+        umask 077
+        ENV_FILE="$(mktemp)"
+
+        # Always-forwarded trio. CONTAINARIUM_ORG is only written when set
+        # (org-id is optional). The token is already a registered secret, so
+        # it's masked by Actions; mask it again defensively in case the value
+        # arrived via a non-secret path.
+        printf 'CONTAINARIUM_SERVER=%s\n' "$CONTAINARIUM_SERVER" >> "$ENV_FILE"
+        printf 'CONTAINARIUM_TOKEN=%s\n'  "$CONTAINARIUM_TOKEN"  >> "$ENV_FILE"
+        [ -n "$CONTAINARIUM_TOKEN" ] && echo "::add-mask::$CONTAINARIUM_TOKEN"
+        if [ -n "$CONTAINARIUM_ORG" ]; then
+          printf 'CONTAINARIUM_ORG=%s\n' "$CONTAINARIUM_ORG" >> "$ENV_FILE"
+        fi
+
+        # Optional extra KEY=VALUE lines. Split on the FIRST '=' only (values
+        # may themselves contain '='), skip blanks/comments, mask every value
+        # so a CONTAINARIUM_TOKEN_PEER can't leak into the log.
+        if [ -n "${EXTRA_ENV:-}" ]; then
+          while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+              ''|'#'*) continue ;;
+            esac
+            key="${line%%=*}"
+            val="${line#*=}"
+            # Trim surrounding whitespace on the key; reject lines with no '='.
+            key="$(printf '%s' "$key" | tr -d '[:space:]')"
+            [ -z "$key" ] && continue
+            [ "$key" = "$line" ] && { echo "::warning::ignoring malformed env line (no '='): $key"; continue; }
+            [ -n "$val" ] && echo "::add-mask::$val"
+            printf '%s=%s\n' "$key" "$val" >> "$ENV_FILE"
+          done <<< "$EXTRA_ENV"
+        fi
+
+        scp -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes "$ENV_FILE" "${SSH_USER}@${SSH_HOST}:~/work/.containarium/env"
+        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o BatchMode=yes "${SSH_USER}@${SSH_HOST}" -- "chmod 600 ~/work/.containarium/env"
+        rm -f "$ENV_FILE"
+
+    # ------------------------------------------------------------------
     # 6. Run setup commands inside the box (the "warm cache" half).
     # ------------------------------------------------------------------
     - name: Run setup
@@ -754,7 +835,7 @@ runs:
         SSH_HOST="${{ steps.create.outputs.ssh-host }}"
         SSH_KEY="${{ steps.sshkey.outputs.priv }}"
         ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o BatchMode=yes "${SSH_USER}@${SSH_HOST}" -- \
-          "cd ~/work && ${{ steps.config.outputs.setup }}"
+          "cd ~/work && set -a; [ -f .containarium/env ] && . ./.containarium/env; set +a; ${{ steps.config.outputs.setup }}"
 
     # ------------------------------------------------------------------
     # 7. Run the actual tests.
@@ -775,7 +856,7 @@ runs:
         # PIPESTATUS so a test failure still fails this step.
         set -o pipefail
         ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o BatchMode=yes "${SSH_USER}@${SSH_HOST}" -- \
-          "cd ~/work && ${{ steps.config.outputs.test }}" \
+          "cd ~/work && set -a; [ -f .containarium/env ] && . ./.containarium/env; set +a; ${{ steps.config.outputs.test }}" \
           2>&1 | tee /tmp/test-output.log
         exit "${PIPESTATUS[0]}"
 
@@ -908,6 +989,15 @@ runs:
         SSH_USER="${{ steps.create.outputs.ssh-user }}"
         SSH_HOST="${{ steps.create.outputs.ssh-host }}"
         SSH_KEY="${{ steps.sshkey.outputs.priv }}"
+
+        # Security: this box is about to be left reachable for the debug
+        # window, so strip the forwarded cloud credentials first. A human or
+        # agent SSHing in to debug must not inherit the CI token (or a
+        # second-org peer token). Best-effort — a failed rm must not turn an
+        # already-red build a different red. Re-running a cloud-calling test
+        # in the debug session will need creds supplied manually.
+        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -o BatchMode=yes "${SSH_USER}@${SSH_HOST}" -- \
+          "rm -f ~/work/.containarium/env" || true
 
         # Refresh ~/work/.containarium/ci-context.json with what we
         # learned from the test run — failing_test name + tail of output.
